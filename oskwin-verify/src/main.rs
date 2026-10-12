@@ -20,10 +20,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetMessageW, KBDLLHOOKSTRUCT, LLKHF_UP, PeekMessageW, PM_REMOVE, RegisterClassW,
-    SetForegroundWindow, SetWindowsHookExW, ShowWindow, SW_SHOW, TranslateMessage,
-    UnhookWindowsHookEx, WNDCLASSW, WH_KEYBOARD_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR,
-    WM_CLOSE, WM_KEYDOWN,
+    GetMessageW, GetSystemMetrics, KBDLLHOOKSTRUCT, LLKHF_UP, PeekMessageW, PM_REMOVE,
+    RegisterClassW, SetForegroundWindow, SetWindowsHookExW, ShowWindow, SW_SHOW,
+    TranslateMessage, UnhookWindowsHookEx, WNDCLASSW, WH_KEYBOARD_LL, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_CHAR, WM_CLOSE, WM_KEYDOWN, SM_CXSCREEN, SM_CYSCREEN,
 };
 
 const CLASS: &str = "oskwin-verify";
@@ -80,7 +80,7 @@ unsafe extern "system" fn wnd_proc(
         ),
         WM_KEYDOWN => println!("keydown vk={:02x}", wparam.0),
         WM_CLOSE => {
-            DestroyWindow(hwnd);
+            let _ = DestroyWindow(hwnd);
             return LRESULT(0);
         }
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -120,7 +120,7 @@ unsafe fn make_window() -> HWND {
 unsafe fn pump() {
     let mut msg = std::mem::zeroed();
     while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-        TranslateMessage(&msg);
+        let _ = TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
 }
@@ -128,7 +128,7 @@ unsafe fn pump() {
 fn run_recv() -> i32 {
     unsafe {
         let hwnd = make_window();
-        SetForegroundWindow(hwnd).ok();
+        let _ = SetForegroundWindow(hwnd);
         pump();
     }
     0
@@ -173,7 +173,7 @@ fn run_selftest() -> i32 {
         let want: [u32; 3] = [0x41, 0x42, 0x33];
         while start.elapsed() < Duration::from_secs(3) {
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-                TranslateMessage(&msg);
+                let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
             let seen = HOOK_KEYS.lock().clone();
@@ -204,9 +204,11 @@ fn run_selftest() -> i32 {
 }
 
 fn run_click(x: i32, y: i32) -> i32 {
+    let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) }.max(1) as u32;
+    let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(1) as u32;
     // Normalize to 0..65535 absolute coordinates.
-    let nx = (x as u32) * 65535 / 1920;
-    let ny = (y as u32) * 65535 / 1080;
+    let nx = ((x as u32) * 65535) / (screen_w - 1).max(1);
+    let ny = ((y as u32) * 65535) / (screen_h - 1).max(1);
     let base: u32 = MOUSEEVENTF_MOVE.0 | MOUSEEVENTF_ABSOLUTE.0;
     let step = |flags: u32| -> INPUT {
         INPUT {

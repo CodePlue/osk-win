@@ -170,12 +170,6 @@ extern "system" {
     fn SelectClipRgn(hdc: HDC, hrgn: HGDIOBJ) -> i32;
 }
 
-#[link(name = "user32")]
-extern "system" {
-    fn GetDC(hwnd: *mut c_void) -> HDC;
-    fn ReleaseDC(hwnd: *mut c_void, hdc: HDC) -> i32;
-}
-
 /// Measured text extents. Bearings are reported as zero, which makes the
 /// UI's bearing-based centering math position text by its top-left corner.
 #[derive(Clone, Copy, Default)]
@@ -217,14 +211,6 @@ pub struct Canvas {
     cur_y: i32,
     shape: Shape,
     states: Vec<i32>,
-}
-
-/// Convert an 0xRRGGBB color to a GDI COLORREF (0x00BBGGRR).
-fn colorref(rgb: u32) -> u32 {
-    let r = rgb & 0xff;
-    let g = (rgb >> 8) & 0xff;
-    let b = (rgb >> 16) & 0xff;
-    (b << 16) | (g << 8) | r
 }
 
 impl Canvas {
@@ -404,11 +390,13 @@ impl Canvas {
         self.shape = Shape::None;
     }
 
+    #[allow(dead_code)]
     pub fn new_sub_path(&mut self) {
         // A rounded rect is built as a subpath of arcs; we set the shape
         // when the arcs are recognized.
     }
 
+    #[allow(dead_code)]
     pub fn close_path(&mut self) {}
 
     pub fn move_to(&mut self, x: f64, y: f64) {
@@ -529,6 +517,7 @@ impl Canvas {
         })
     }
 
+    #[allow(dead_code)]
     pub fn paint(&mut self) {
         // Fill the whole buffer with the current color (for the clear, the
         // caller cleared the buffer first; this is a no-op in that case).
@@ -545,10 +534,13 @@ impl Canvas {
         }
     }
 
+    #[allow(dead_code)]
     pub fn set_operator(&mut self, _op: u32) {}
 
+    #[allow(dead_code)]
     pub fn identity_matrix(&mut self) {}
 
+    #[allow(dead_code)]
     pub fn scale(&mut self, _sx: f64, _sy: f64) {
         // Rendered at 1:1; no scaling.
     }

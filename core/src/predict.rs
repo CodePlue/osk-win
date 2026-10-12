@@ -82,6 +82,18 @@ impl UserHistory {
     /// `$XDG_DATA_HOME/osk/user_history.tsv`, else
     /// `~/.local/share/osk/user_history.tsv`.
     fn default_path() -> PathBuf {
+        if let Some(appdata) = std::env::var_os("APPDATA").or_else(|| std::env::var_os("LOCALAPPDATA")) {
+            let p = PathBuf::from(appdata);
+            if p.is_absolute() {
+                return p.join("osk").join("user_history.tsv");
+            }
+        }
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            let p = PathBuf::from(profile);
+            if p.is_absolute() {
+                return p.join("AppData").join("Roaming").join("osk").join("user_history.tsv");
+            }
+        }
         if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
             let p = PathBuf::from(xdg);
             if p.is_absolute() {

@@ -68,10 +68,10 @@ pub fn vk_for(code: u16) -> Option<u16> {
         key::KEY_MINUS => Some(0xBD),
         key::KEY_EQUAL => Some(0xBB),
         key::KEY_LEFTBRACE => Some(0xDB),
-        key::KEY_RIGHTBRACE => Some(0xDC),
-        key::KEY_BACKSLASH => Some(0xC5),
+        key::KEY_RIGHTBRACE => Some(0xDD),
+        key::KEY_BACKSLASH => Some(0xDC),
         key::KEY_SEMICOLON => Some(0xBA),
-        key::KEY_APOSTROPHE => Some(0xE2),
+        key::KEY_APOSTROPHE => Some(0xDE),
         key::KEY_GRAVE => Some(0xC0),
         key::KEY_COMMA => Some(0xBC),
         key::KEY_DOT => Some(0xBE),
@@ -81,14 +81,14 @@ pub fn vk_for(code: u16) -> Option<u16> {
         key::KEY_F2 => Some(0x71),
         key::KEY_F3 => Some(0x72),
         key::KEY_F4 => Some(0x73),
-        key::KEY_F5 => Some(0x75),
-        key::KEY_F6 => Some(0x76),
-        key::KEY_F7 => Some(0x77),
-        key::KEY_F8 => Some(0x78),
-        key::KEY_F9 => Some(0x79),
+        key::KEY_F5 => Some(0x74),
+        key::KEY_F6 => Some(0x75),
+        key::KEY_F7 => Some(0x76),
+        key::KEY_F8 => Some(0x77),
+        key::KEY_F9 => Some(0x78),
         key::KEY_F10 => Some(0x79),
-        key::KEY_F11 => Some(0x7B),
-        key::KEY_F12 => Some(0x7C),
+        key::KEY_F11 => Some(0x7A),
+        key::KEY_F12 => Some(0x7B),
         // Navigation cluster.
         key::KEY_UP => Some(0x26),
         key::KEY_DOWN => Some(0x28),
@@ -110,5 +110,48 @@ pub fn vk_for(code: u16) -> Option<u16> {
         key::KEY_KPSLASH => Some(0x6F),
         key::KEY_KPEQUAL => Some(0xBB),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_vk_letters_and_digits() {
+        assert_eq!(vk_for(key::KEY_A), Some(0x41));
+        assert_eq!(vk_for(key::KEY_Z), Some(0x5A));
+        assert_eq!(vk_for(key::KEY_0), Some(0x30));
+        assert_eq!(vk_for(key::KEY_1), Some(0x31));
+        assert_eq!(vk_for(key::KEY_9), Some(0x39));
+    }
+
+    #[test]
+    fn test_vk_function_keys() {
+        assert_eq!(vk_for(key::KEY_F1), Some(0x70));
+        assert_eq!(vk_for(key::KEY_F4), Some(0x73));
+        assert_eq!(vk_for(key::KEY_F5), Some(0x74));
+        assert_eq!(vk_for(key::KEY_F6), Some(0x75));
+        assert_eq!(vk_for(key::KEY_F7), Some(0x76));
+        assert_eq!(vk_for(key::KEY_F8), Some(0x77));
+        assert_eq!(vk_for(key::KEY_F9), Some(0x78));
+        assert_eq!(vk_for(key::KEY_F10), Some(0x79));
+        assert_eq!(vk_for(key::KEY_F11), Some(0x7A));
+        assert_eq!(vk_for(key::KEY_F12), Some(0x7B));
+    }
+
+    #[test]
+    fn test_vk_oem_symbols() {
+        assert_eq!(vk_for(key::KEY_LEFTBRACE), Some(0xDB));
+        assert_eq!(vk_for(key::KEY_RIGHTBRACE), Some(0xDD));
+        assert_eq!(vk_for(key::KEY_BACKSLASH), Some(0xDC));
+        assert_eq!(vk_for(key::KEY_SEMICOLON), Some(0xBA));
+        assert_eq!(vk_for(key::KEY_APOSTROPHE), Some(0xDE));
+        assert_eq!(vk_for(key::KEY_GRAVE), Some(0xC0));
+        assert_eq!(vk_for(key::KEY_COMMA), Some(0xBC));
+        assert_eq!(vk_for(key::KEY_DOT), Some(0xBE));
+        assert_eq!(vk_for(key::KEY_SLASH), Some(0xBF));
+        assert_eq!(vk_for(key::KEY_MINUS), Some(0xBD));
+        assert_eq!(vk_for(key::KEY_EQUAL), Some(0xBB));
     }
 }

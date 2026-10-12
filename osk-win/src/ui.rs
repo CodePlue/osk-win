@@ -498,6 +498,30 @@ fn config_path() -> Option<PathBuf> {
             return Some(PathBuf::from(trimmed));
         }
     }
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let trimmed = appdata.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed).join("osk").join("config.json"));
+        }
+    }
+    if let Ok(localappdata) = std::env::var("LOCALAPPDATA") {
+        let trimmed = localappdata.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed).join("osk").join("config.json"));
+        }
+    }
+    if let Ok(userprofile) = std::env::var("USERPROFILE") {
+        let trimmed = userprofile.trim();
+        if !trimmed.is_empty() {
+            return Some(
+                PathBuf::from(trimmed)
+                    .join("AppData")
+                    .join("Roaming")
+                    .join("osk")
+                    .join("config.json"),
+            );
+        }
+    }
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
         let trimmed = xdg.trim();
         if !trimmed.is_empty() {
@@ -536,7 +560,14 @@ impl PersistentConfig {
         };
         let tmp = path.with_extension("tmp");
         if std::fs::write(&tmp, json.as_bytes()).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
+            if std::fs::rename(&tmp, &path).is_err() {
+                let _ = std::fs::remove_file(&path);
+                if std::fs::rename(&tmp, &path).is_err() {
+                    let _ = std::fs::write(&path, json.as_bytes());
+                }
+            }
+        } else {
+            let _ = std::fs::write(&path, json.as_bytes());
         }
     }
 }
@@ -639,8 +670,17 @@ impl State {
 
         let initial_pos_x = if config.pos_x >= 0 { config.pos_x } else { 600 };
         let initial_pos_y = if config.pos_y >= 0 { config.pos_y } else { 450 };
-        let initial_w = if config.width >= MIN_W { config.width } else { 0 };
-        let initial_h = if config.height >= MIN_H { config.height } else { 0 };
+        let initial_layout = ALL_LAYOUTS[initial_layout_idx];
+        let rows = initial_layout.rows.len() as f64;
+        let mut cols = 0;
+        for row in initial_layout.rows {
+            let row_units: u16 = row.keys.iter().map(|k| k.width).sum();
+            cols = cols.max(row_units);
+        }
+        let default_w = ((cols as f64 / 20.0 + 2.0 * MARGIN_U) * U0 + 0.5) as i32;
+        let default_h = ((BAR_U + rows + 2.0 * MARGIN_U) * U0 + 0.5) as i32;
+        let initial_w = if config.width >= MIN_W { config.width } else { default_w };
+        let initial_h = if config.height >= MIN_H { config.height } else { default_h };
 
         let mut state = State {
             backend,
@@ -886,6 +926,22 @@ impl State {
         }
         self.canvas = Some(canvas);
         self.dirty = false;
+        self.sugg = bar.sugg;
+        self.n_sugg = bar.n_sugg;
+        self.layout_rect = bar.layout_rect;
+        self.theme_rect = bar.theme_rect;
+        self.close_rect = bar.close_rect;
+        self.theme_menu_rect = bar.theme_menu_rect;
+        self.theme_item_rects = bar.theme_item_rects;
+        self.dict_rect = bar.dict_rect;
+        self.dict_menu_rect = bar.dict_menu_rect;
+        self.dict_tab_toggle_rect = bar.dict_tab_toggle_rect;
+        self.dict_clear_rect = bar.dict_clear_rect;
+        self.dict_prev_rect = bar.dict_prev_rect;
+        self.dict_next_rect = bar.dict_next_rect;
+        self.dict_remove_rects = bar.dict_remove_rects;
+        self.dict_words = bar.dict_words;
+        self.n_dict_items = bar.n_dict_items;
     }
 
     /// Render the keyboard to a PPM file (headless verification).
@@ -2353,6 +2409,13 @@ pub fn run(backend: Box<dyn Backend>) -> i32 {
         eprintln!("osk: RegisterClassExW failed");
         return 1;
     }
+    let rows = state.layout().rows.len() as f64;
+    if state.width < MIN_W {
+        state.width = ((state.grid_cols as f64 / 20.0 + 2.0 * MARGIN_U) * U0 + 0.5) as i32;
+    }
+    if state.height < MIN_H {
+        state.height = ((BAR_U + rows + 2.0 * MARGIN_U) * U0 + 0.5) as i32;
+    }
     unsafe {
         STATE_PTR = &mut *state as *mut State;
     }
@@ -2403,3 +2466,54 @@ pub fn run(backend: Box<dyn Backend>) -> i32 {
     state.backend.destroy();
     0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_persistent_config_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("osk-test-config-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+
+        let cfg = PersistentConfig {
+            pos_x: 250,
+            pos_y: 350,
+            width: 750,
+            height: 280,
+            theme: "Nord".to_string(),
+            layout: "65%+Num".to_string(),
+            tab_accepts_prediction: true,
+        };
+
+        let json = serde_json::to_string_pretty(&cfg).unwrap();
+        std::fs::write(&path, json).unwrap();
+
+        let loaded: PersistentConfig = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(loaded.pos_x, 250);
+        assert_eq!(loaded.pos_y, 350);
+        assert_eq!(loaded.width, 750);
+        assert_eq!(loaded.height, 280);
+        assert_eq!(loaded.theme, "Nord");
+        assert_eq!(loaded.layout, "65%+Num");
+        assert!(loaded.tab_accepts_prediction);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_config_path_resolution() {
+        let test_val = "Z:/tmp/test_osk_cfg.json";
+        unsafe {
+            std::env::set_var("OSK_CONFIG", test_val);
+        }
+        let p = config_path();
+        assert_eq!(p, Some(PathBuf::from(test_val)));
+        unsafe {
+            std::env::remove_var("OSK_CONFIG");
+        }
+    }
+}
+

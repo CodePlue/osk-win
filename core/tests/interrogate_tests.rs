@@ -388,6 +388,7 @@ fn test_neural_engine_graceful_fallback() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[allow(dead_code)]
 static TEST_GLOBAL_ENGINE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 #[cfg(feature = "neural")]
