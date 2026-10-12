@@ -1,55 +1,41 @@
-//! The wlr-layer-shell cairo UI.
+//! The Win32/GDI on-screen keyboard.
 //!
-//! The keyboard is a layer surface (layer=top, keyboard_interactivity=none)
-//! so it is always on top, never steals keyboard focus, and still receives
-//! pointer events. Injected keys land in whatever window the user focused.
+//! The keyboard is a topmost, non-activating popup window. `MA_NOACTIVATE`
+//! in the window procedure keeps it from stealing focus, so injected keys
+//! land in whatever window the user focused. Pointer events are delivered
+//! normally because the window is not `WS_EX_TRANSPARENT`.
 //!
-//! Buffer contract (what Hyprland expects from a layer client):
-//!   * fractional scale + wp_viewport destination = logical size, buffer
-//!     scale 1
-//!   * damage_buffer in buffer pixels
-//!   * opaque region over the whole surface (XRGB, corners opaque black)
-//!   * one commit per presented frame, except a key tap which commits
-//!     immediately
+//! Rendering: the keyboard is drawn into a 32-bit back buffer (the
+//! [`Canvas`]) and blitted to the window DC on `WM_PAINT`. There is no
+//! compositor to negotiate with, so a resize is a plain `SetWindowPos`.
 
-use std::fs::File;
-use std::io::{Seek, SeekFrom, Write};
-use std::os::unix::io::{AsFd, AsRawFd};
 use std::path::PathBuf;
 use std::sync::LazyLock;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use cairo::{Context, FontSlant, FontWeight, Format, ImageSurface, Operator};
-use osk_core::events::{complete_word, tap_events, OskEvent, TAP_MAX_EVENTS};
-use osk_core::key::{key, Key, Layout};
-use osk_core::layout::ALL_LAYOUTS;
-use osk_core::mods::{mod_index, ModKeyState, ModifierEngine};
-use osk_core::predict::Predictor;
-use osk_core::typekey::{type_string, CharMap};
-use wayland_client::backend::WaylandError;
-use wayland_client::globals::{registry_queue_init, GlobalListContents};
-use wayland_client::protocol::{
-    wl_buffer, wl_callback, wl_compositor, wl_pointer, wl_region, wl_registry, wl_seat, wl_shm,
-    wl_shm_pool, wl_surface,
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, EndPaint, GetDC, InvalidateRect, PAINTSTRUCT, ReleaseDC,
 };
-use wayland_client::{Connection, Dispatch, QueueHandle};
-use wayland_protocols::wp::fractional_scale::v1::client::{
-    wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
-    wp_fractional_scale_v1::WpFractionalScaleV1,
-};
-use wayland_protocols::wp::relative_pointer::zv1::client::{
-    zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
-    zwp_relative_pointer_v1::ZwpRelativePointerV1,
-};
-use wayland_protocols::wp::viewporter::client::{
-    wp_viewport::WpViewport, wp_viewporter::WpViewporter,
-};
-use wayland_protocols_wlr::layer_shell::v1::client::{
-    zwlr_layer_shell_v1::{Layer, ZwlrLayerShellV1},
-    zwlr_layer_surface_v1::{Anchor, KeyboardInteractivity, ZwlrLayerSurfaceV1},
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, KillTimer,
+    PostQuitMessage, RegisterClassExW, SetTimer, SetWindowPos, ShowWindow, TranslateMessage,
+    WNDCLASSEXW, CS_HREDRAW, CS_VREDRAW, MSG, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WM_DESTROY, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN, WM_SIZE, WM_TIMER,
 };
 
-use osk_backend::{Backend, BackendSink};
+use crate::backend::{Backend, BackendSink};
+use crate::gdip::Canvas;
+use oskwin_core::events::{complete_word, tap_events, OskEvent, TAP_MAX_EVENTS};
+use oskwin_core::key::{key, Key, Layout};
+use oskwin_core::layout::ALL_LAYOUTS;
+use oskwin_core::mods::{mod_index, ModKeyState, ModifierEngine};
+use oskwin_core::predict::Predictor;
+use oskwin_core::typekey::{type_string, CharMap};
 
 // ---- geometry, in key units (1u = one normal key) ----
 // Thinner keyboard profile: 0.12u margin, 0.65u top bar, 42px unit.
@@ -65,15 +51,11 @@ const U0: f64 = 46.0;
 /// Smallest surface the resize handle allows.
 const MIN_W: i32 = 200;
 const MIN_H: i32 = 180;
-// Linux input code for the left mouse button. wlroots/Hyprland report this
-// in wl_pointer.button instead of the Wayland number 1.
-const BTN_LEFT: u32 = 272;
-const BTN_RIGHT: u32 = 273;
 const FLASH_MS: u64 = 150;
 
 // Sans-serif face for the labels; it carries every glyph we draw
 // (letters, digits, and the arrow/symbol caps) in one font.
-const FONT: &str = "Adwaita Sans";
+const FONT: &str = "Segoe UI";
 
 #[derive(Clone, Copy, Debug)]
 pub struct Theme {
@@ -398,20 +380,13 @@ pub static THEMES: &[Theme] = &[
     },
 ];
 
-/// Token for the Wayland connection fd in the poller.
-const WL_TOKEN: mio::Token = mio::Token(0);
-
 static START: LazyLock<Instant> = LazyLock::new(Instant::now);
-
-fn debug() -> bool {
-    std::env::var_os("OSK_DEBUG").is_some()
-}
 
 fn now_ms() -> u64 {
     START.elapsed().as_millis() as u64
 }
 
-fn set_src_rgba(cr: &Context, argb: u32, alpha: f64) {
+fn set_src_rgba(cr: &mut Canvas, argb: u32, alpha: f64) {
     cr.set_source_rgba(
         ((argb >> 16) & 0xff) as f64 / 255.0,
         ((argb >> 8) & 0xff) as f64 / 255.0,
@@ -420,12 +395,13 @@ fn set_src_rgba(cr: &Context, argb: u32, alpha: f64) {
     );
 }
 
-fn set_src(cr: &Context, argb: u32) {
+fn set_src(cr: &mut Canvas, argb: u32) {
     set_src_rgba(cr, argb, 1.0);
 }
 
-/// Rounded rectangle subpath.
-fn rrect(cr: &Context, x: f64, y: f64, w: f64, h: f64, rad: f64) {
+/// Rounded rectangle. The radius is clamped to half the smaller side so the
+/// arcs never overlap.
+fn rrect(cr: &mut Canvas, x: f64, y: f64, w: f64, h: f64, rad: f64) {
     let mut r = rad;
     if r > w / 2.0 {
         r = w / 2.0;
@@ -433,13 +409,7 @@ fn rrect(cr: &Context, x: f64, y: f64, w: f64, h: f64, rad: f64) {
     if r > h / 2.0 {
         r = h / 2.0;
     }
-    let half = std::f64::consts::FRAC_PI_2;
-    cr.new_sub_path();
-    cr.arc(x + w - r, y + r, r, -half, 0.0);
-    cr.arc(x + w - r, y + h - r, r, 0.0, half);
-    cr.arc(x + r, y + h - r, r, half, std::f64::consts::PI);
-    cr.arc(x + r, y + r, r, std::f64::consts::PI, half * 3.0);
-    cr.close_path();
+    cr.rrect(x, y, w, h, r);
 }
 
 /// A measured rectangle in logical coordinates.
@@ -478,35 +448,6 @@ struct BarLayout {
     dict_remove_rects: [Rect; 8],
     dict_words: [Option<&'static str>; 8],
     n_dict_items: usize,
-}
-
-/// One shm frame. The cairo surface owns the pixel buffer; the memfd holds
-/// a copy of it for the compositor to mmap. Two frames are kept so the
-/// compositor can read one while we draw into the other.
-struct Frame {
-    surface: Option<ImageSurface>,
-    file: Option<File>,
-    pool: Option<wl_shm_pool::WlShmPool>,
-    buf: Option<wl_buffer::WlBuffer>,
-    attached: bool,
-    buf_w: i32,
-    buf_h: i32,
-    stride: i32,
-}
-
-impl Frame {
-    const fn new() -> Self {
-        Self {
-            surface: None,
-            file: None,
-            pool: None,
-            buf: None,
-            attached: false,
-            buf_w: 0,
-            buf_h: 0,
-            stride: 0,
-        }
-    }
 }
 
 /// Saved preferences and window geometry persisted between runs.
@@ -600,37 +541,17 @@ impl PersistentConfig {
     }
 }
 
-struct State {
+pub struct State {
     backend: Box<dyn Backend>,
-    qh: QueueHandle<State>,
-    // bound globals
-    comp: Option<wl_compositor::WlCompositor>,
-    seat: Option<wl_seat::WlSeat>,
-    shm: Option<wl_shm::WlShm>,
-    layer_shell: Option<ZwlrLayerShellV1>,
-    frac_mgr: Option<WpFractionalScaleManagerV1>,
-    viewporter: Option<WpViewporter>,
-    rel_mgr: Option<ZwpRelativePointerManagerV1>,
-    // surface objects
-    surface: Option<wl_surface::WlSurface>,
-    layer: Option<ZwlrLayerSurfaceV1>,
-    pointer: Option<wl_pointer::WlPointer>,
-    frac: Option<WpFractionalScaleV1>,
-    viewport: Option<WpViewport>,
-    rel: Option<ZwpRelativePointerV1>,
-    // frames
-    frames: [Frame; 2],
-    cur_frame: usize,
-    attached_w: i32,
-    attached_h: i32,
+    /// Window handle, set once the window is created (0 before that).
+    pub hwnd: isize,
+    /// Cached back buffer, recreated when the window is resized.
+    canvas: Option<Canvas>,
     // geometry (logical)
     width: i32,
     height: i32,
     pos_x: i32,
     pos_y: i32,
-    scale_120: i32,
-    buf_scale: i32,
-    ready: bool,
     // pointer
     px: i32,
     py: i32,
@@ -648,8 +569,9 @@ struct State {
     rsz_h: i32,
     grab_lx: i32,
     grab_ly: i32,
-    drag_fx: f64,
-    drag_fy: f64,
+    // window position at the start of a bar drag (drag base)
+    shown_x: i32,
+    shown_y: i32,
     // key repeat
     rep_key: i32,
     rep_next: u64,
@@ -660,14 +582,6 @@ struct State {
     charmap: Option<CharMap>,
     // rendering
     dirty: bool,
-    frame_pending: bool,
-    frame_gen: u32,
-    presented: bool,
-    last_commit_ms: u64,
-    commit_x: i32,
-    commit_y: i32,
-    shown_x: i32,
-    shown_y: i32,
     last_hot: u32,
     last_geom: (i32, i32, i32, i32),
     // measured bar layout (filled during render)
@@ -699,16 +613,11 @@ struct State {
 }
 
 impl State {
-    fn new(
-        backend: Box<dyn Backend>,
-        qh: QueueHandle<State>,
-    ) -> Self {
+    pub fn new(backend: Box<dyn Backend>) -> Self {
         let config = PersistentConfig::load();
         let initial_theme_idx = std::env::var("OSK_THEME")
             .ok()
-            .and_then(|name| {
-                THEMES.iter().position(|t| t.name.eq_ignore_ascii_case(&name))
-            })
+            .and_then(|name| THEMES.iter().position(|t| t.name.eq_ignore_ascii_case(&name)))
             .or_else(|| {
                 if !config.theme.is_empty() {
                     THEMES.iter().position(|t| t.name.eq_ignore_ascii_case(&config.theme))
@@ -735,31 +644,12 @@ impl State {
 
         let mut state = State {
             backend,
-            qh,
-            comp: None,
-            seat: None,
-            shm: None,
-            layer_shell: None,
-            frac_mgr: None,
-            viewporter: None,
-            rel_mgr: None,
-            surface: None,
-            layer: None,
-            pointer: None,
-            frac: None,
-            viewport: None,
-            rel: None,
-            frames: [Frame::new(), Frame::new()],
-            cur_frame: 0,
-            attached_w: 0,
-            attached_h: 0,
+            hwnd: 0,
+            canvas: None,
             width: initial_w,
             height: initial_h,
             pos_x: initial_pos_x,
             pos_y: initial_pos_y,
-            scale_120: 120,
-            buf_scale: 1,
-            ready: false,
             px: 0,
             py: 0,
             inside: false,
@@ -774,8 +664,8 @@ impl State {
             rsz_h: 0,
             grab_lx: 0,
             grab_ly: 0,
-            drag_fx: 0.0,
-            drag_fy: 0.0,
+            shown_x: initial_pos_x,
+            shown_y: initial_pos_y,
             rep_key: -1,
             rep_next: 0,
             grid_cols: 0,
@@ -783,14 +673,6 @@ impl State {
             predictor: Predictor::new(),
             charmap: CharMap::new(),
             dirty: false,
-            frame_pending: false,
-            frame_gen: 0,
-            presented: false,
-            last_commit_ms: 0,
-            commit_x: 0,
-            commit_y: 0,
-            shown_x: initial_pos_x,
-            shown_y: initial_pos_y,
             last_hot: 0,
             last_geom: (-1, -1, -1, -1),
             sugg: [Rect::default(); 5],
@@ -798,6 +680,9 @@ impl State {
             layout_rect: Rect::default(),
             theme_rect: Rect::default(),
             close_rect: Rect::default(),
+            layout_idx: initial_layout_idx,
+            theme_idx: initial_theme_idx,
+            theme,
             theme_menu_open: false,
             theme_menu_rect: Rect::default(),
             theme_item_rects: [Rect::default(); 12],
@@ -813,9 +698,6 @@ impl State {
             dict_remove_rects: [Rect::default(); 8],
             dict_words: [None; 8],
             n_dict_items: 0,
-            layout_idx: initial_layout_idx,
-            theme_idx: initial_theme_idx,
-            theme,
             quit: false,
         };
         state.compute_grid_cols();
@@ -849,24 +731,6 @@ impl State {
             }
         }
         self.grid_cols = cols;
-    }
-
-    /// Logical pixels -> buffer pixels at the current scale.
-    fn buffer_px(&self, logical: i32) -> i32 {
-        if logical <= 0 {
-            return 0;
-        }
-        let scale = if self.scale_120 > 0 {
-            self.scale_120
-        } else {
-            120
-        };
-        if self.viewport.is_some() {
-            (logical * scale + 119) / 120
-        } else {
-            let s = (scale / 120).max(1);
-            logical * s
-        }
     }
 
     // ---- geometry ----
@@ -969,336 +833,77 @@ impl State {
     fn apply_geometry(&mut self) {
         let geom = (self.pos_x, self.pos_y, self.width, self.height);
         // Identical re-sends are skipped so a stationary pointer during a
-        // drag costs no protocol traffic.
+        // drag costs no API traffic.
         if geom == self.last_geom {
             return;
         }
         self.last_geom = geom;
-        let Some(layer) = self.layer.as_ref() else {
-            return;
-        };
-        // anchor top|left and position via margins: the left/top margins
-        // are the surface origin.
-        layer.set_anchor(Anchor::Top | Anchor::Left);
-        layer.set_margin(self.pos_y, 0, 0, self.pos_x);
-        layer.set_size(self.width as u32, self.height as u32);
-        self.sync_regions();
-        self.sync_viewport();
-        self.sync_buffer_scale();
-        if self.frame_pending {
-            // A commit is already in flight; the requests above take
-            // effect on it. The watchdog forces it if the callback never
-            // comes.
-            self.dirty = true;
-            return;
+        if self.hwnd != 0 {
+            let _ = unsafe {
+                SetWindowPos(
+                    HWND(self.hwnd as *mut _),
+                    None,
+                    self.pos_x,
+                    self.pos_y,
+                    self.width,
+                    self.height,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+            };
         }
-        // A size change has to commit together with a buffer at the new
-        // pixel size; a pure move can commit with no new buffer.
-        if self.ready && (self.width != self.attached_w || self.height != self.attached_h) {
-            self.dirty = true;
-            self.request_redraw();
-            return;
-        }
-        // Geometry requests take effect on the next commit. Pace to one
-        // commit per presented frame once the surface has been shown;
-        // before that, no callback will fire.
-        if self.presented {
-            self.arm_frame();
-        }
-        if let Some(surf) = self.surface.as_ref() {
-            surf.commit();
-        }
-        self.commit_x = self.pos_x;
-        self.commit_y = self.pos_y;
-        self.last_commit_ms = now_ms();
-    }
-
-    fn sync_regions(&mut self) {
-        let Some(surf) = self.surface.as_ref() else {
-            return;
-        };
-        let Some(comp) = self.comp.as_ref() else {
-            return;
-        };
-        if self.width <= 0 || self.height <= 0 {
-            return;
-        }
-        let region = comp.create_region(&self.qh, ());
-        region.add(0, 0, self.width, self.height);
-        eprintln!(
-            "[dbg] input_region set to 0,0 {}x{}",
-            self.width, self.height
-        );
-        surf.set_input_region(Some(&region));
-        region.destroy();
-        surf.set_opaque_region(None);
-    }
-
-    fn sync_viewport(&mut self) {
-        let Some(vp) = self.viewport.as_ref() else {
-            return;
-        };
-        if self.width <= 0 || self.height <= 0 {
-            return;
-        }
-        vp.set_destination(self.width, self.height);
-    }
-
-    fn sync_buffer_scale(&mut self) {
-        // Fractional-scale path: buffer scale stays 1. Without a viewport,
-        // fall back to an integer buffer scale.
-        if self.viewport.is_some() {
-            return;
-        }
-        let s = (if self.scale_120 > 0 {
-            self.scale_120
-        } else {
-            120
-        } / 120)
-            .max(1);
-        if s == self.buf_scale {
-            return;
-        }
-        self.buf_scale = s;
-        if let Some(surf) = self.surface.as_ref() {
-            surf.set_buffer_scale(s);
-        }
-    }
-
-    fn arm_frame(&mut self) {
-        if self.frame_pending {
-            return;
-        }
-        let Some(surf) = self.surface.as_ref() else {
-            return;
-        };
-        self.frame_gen += 1;
-        let _cb = surf.frame(&self.qh, self.frame_gen);
-        self.frame_pending = true;
     }
 
     // ---- redraw ----
 
-    fn request_redraw(&mut self) {
-        self.dirty = true;
-        if !self.frame_pending {
-            // No commit in flight: render now; its commit requests the
-            // frame callback that presents this and any later coalesced
-            // redraws.
-            self.dirty = false;
-            self.render();
+    /// Mark the window invalid; the message loop turns that into a
+    /// `WM_PAINT` that calls [`State::render`].
+    fn request_redraw(&self) {
+        if self.hwnd != 0 {
+            let _ = unsafe { InvalidateRect(Some(HWND(self.hwnd as *mut _)), None, false) };
         }
     }
 
+    /// Draw the keyboard into the back buffer and blit it to the window.
     fn render(&mut self) {
-        if !self.ready {
+        if self.width <= 0 || self.height <= 0 || self.hwnd == 0 {
             return;
         }
-        let buf_w = self.buffer_px(self.width);
-        let buf_h = self.buffer_px(self.height);
-        if buf_w <= 0 || buf_h <= 0 {
-            return;
-        }
-        let prefer = self.cur_frame;
-        let order = [prefer, (prefer + 1) % 2];
-        let mut chosen: Option<usize> = None;
-        for &i in &order {
-            if self.frames[i].attached {
-                continue;
-            }
-            if self.frame_alloc(i, buf_w, buf_h) {
-                chosen = Some(i);
-                break;
-            }
-        }
-        let Some(i) = chosen else {
-            // Both buffers are in use; a release or the frame callback
-            // will retry.
-            self.dirty = true;
-            return;
+        let mut canvas = match self.canvas.take() {
+            Some(c) if c.w == self.width && c.h == self.height => c,
+            _ => match Canvas::new_bitmap(self.width, self.height) {
+                Some(c) => c,
+                None => return,
+            },
         };
-        self.cur_frame = i;
-        // Take the surface out so the drawing borrows a local, not self.
-        let Some(mut surface) = self.frames[i].surface.take() else {
-            self.dirty = true;
-            return;
-        };
-        // Measure the bar first: text extents need a live context, and
-        // the rects are stored for hit testing.
-        let Ok(meas) = Context::new(&surface) else {
-            self.frames[i].surface = Some(surface);
-            self.dirty = true;
-            return;
-        };
-        meas.select_font_face(FONT, FontSlant::Normal, FontWeight::Normal);
-        let bar = self.measure_bar(&meas);
-        drop(meas);
-        let Ok(cr) = Context::new(&surface) else {
-            self.frames[i].surface = Some(surface);
-            self.dirty = true;
-            return;
-        };
-        self.paint(&cr, &bar);
-        drop(cr);
-        let mut write_ok = false;
-        if let Ok(pixels) = surface.data() {
-            if let Some(file) = self.frames[i].file.as_mut() {
-                // The buffer is the file's first `need` bytes; without rewinding,
-                // the second frame appends past the buffer and the compositor
-                // keeps showing frame one.
-                write_ok = file.seek(SeekFrom::Start(0)).is_ok()
-                    && file.write_all(&pixels).is_ok();
-            }
+        canvas.clear();
+        let bar = self.measure_bar(&mut canvas);
+        self.paint(&mut canvas, &bar);
+        let hwnd = HWND(self.hwnd as *mut _);
+        let hdc = unsafe { GetDC(Some(hwnd)) };
+        canvas.blit_to_hdc(hdc.0);
+        unsafe {
+            ReleaseDC(Some(hwnd), hdc);
         }
-        self.frames[i].surface = Some(surface);
-        if !write_ok {
-            self.dirty = true;
-            return;
-        }
-        if std::env::var("OSK_DEBUG_PPM").is_ok() {
-            let px = self.px;
-            let py = self.py;
-            let inside = self.inside;
-            let key_at = self.key_at(px, py);
-            let hot = key_at
-                .map(|k| format!("k{}", k))
-                .unwrap_or_else(|| "none".to_string());
-            if let Some(surf) = self.frames[i].surface.as_mut() {
-                if let Ok(pixels) = surf.data() {
-                    eprintln!(
-                        "[dbg-ppm] writing ppm px={} py={} inside={} hot={:?}",
-                        px, py, inside, key_at
-                    );
-                    let mut out = Vec::new();
-                    out.extend_from_slice(format!("P6\n{} {}\n255\n", buf_w, buf_h).as_bytes());
-                    for p in pixels.chunks(4) {
-                        out.push(p[2]);
-                        out.push(p[1]);
-                        out.push(p[0]);
-                    }
-                    let _ = std::fs::write(format!("/tmp/osk_render_{}.ppm", hot), out);
-                }
-            }
-        }
-        let Some(buf) = self.frames[i].buf.as_ref() else {
-            self.dirty = true;
-            return;
-        };
-        self.frames[i].attached = true;
-        let Some(surf) = self.surface.clone() else {
-            return;
-        };
-        surf.attach(Some(buf), 0, 0);
-        // damage_buffer is buffer pixels; wl_surface.damage would
-        // mis-scale under a viewport.
-        surf.damage_buffer(0, 0, buf_w, buf_h);
-        self.sync_regions();
-        self.sync_viewport();
-        self.sync_buffer_scale();
-        // Arm before the commit so this present is what fires the
-        // callback. A key tap may commit while one is already in flight;
-        // a second callback would clear frame_pending early and break
-        // coalescing.
-        if !self.frame_pending {
-            self.arm_frame();
-        }
-        surf.commit();
-        self.commit_x = self.pos_x;
-        self.commit_y = self.pos_y;
-        self.last_commit_ms = now_ms();
-        self.attached_w = self.width;
-        self.attached_h = self.height;
+        self.canvas = Some(canvas);
         self.dirty = false;
-        self.sugg = bar.sugg;
-        self.n_sugg = bar.n_sugg;
-        self.layout_rect = bar.layout_rect;
-        self.theme_rect = bar.theme_rect;
-        self.close_rect = bar.close_rect;
-        self.theme_menu_rect = bar.theme_menu_rect;
-        self.theme_item_rects = bar.theme_item_rects;
-        self.dict_rect = bar.dict_rect;
-        self.dict_menu_rect = bar.dict_menu_rect;
-        self.dict_tab_toggle_rect = bar.dict_tab_toggle_rect;
-        self.dict_clear_rect = bar.dict_clear_rect;
-        self.dict_prev_rect = bar.dict_prev_rect;
-        self.dict_next_rect = bar.dict_next_rect;
-        self.dict_remove_rects = bar.dict_remove_rects;
-        self.dict_words = bar.dict_words;
-        self.n_dict_items = bar.n_dict_items;
-        self.last_hot = self.hot_sig();
     }
 
-    fn frame_free(&mut self, i: usize) {
-        let frame = &mut self.frames[i];
-        if let Some(buf) = frame.buf.take() {
-            buf.destroy();
+    /// Render the keyboard to a PPM file (headless verification).
+    pub fn render_to_ppm(&mut self, path: &str) -> bool {
+        let rows = self.layout().rows.len() as f64;
+        if self.width < MIN_W {
+            self.width = ((self.grid_cols as f64 / 20.0 + 2.0 * MARGIN_U) * U0 + 0.5) as i32;
         }
-        if let Some(pool) = frame.pool.take() {
-            pool.destroy();
+        if self.height < MIN_H {
+            self.height = ((BAR_U + rows + 2.0 * MARGIN_U) * U0 + 0.5) as i32;
         }
-        frame.surface = None;
-        frame.file = None;
-        frame.attached = false;
-        frame.buf_w = 0;
-        frame.buf_h = 0;
-        frame.stride = 0;
-    }
-
-    fn frame_alloc(&mut self, i: usize, buf_w: i32, buf_h: i32) -> bool {
-        if self.frames[i].attached {
-            return false;
-        }
-        if self.frames[i].surface.is_some()
-            && self.frames[i].buf_w == buf_w
-            && self.frames[i].buf_h == buf_h
-        {
-            return true;
-        }
-        self.frame_free(i);
-        let stride = ((buf_w * 4) + 63) & !63;
-        let need = stride * buf_h;
-        if need <= 0 {
-            return false;
-        }
-        // Extra rows so a resize drag grows the pool once, not every
-        // motion event.
-        let cap = need + stride * 160;
-        let memfd = match memfd::MemfdOptions::default().create("osk-frame") {
-            Ok(m) => m,
-            Err(_) => return false,
-        };
-        let file = memfd.into_file();
-        if file.set_len(cap as u64).is_err() {
-            return false;
-        }
-        let pixels = vec![0u8; need as usize];
-        let surface =
-            match ImageSurface::create_for_data(pixels, Format::ARgb32, buf_w, buf_h, stride) {
-                Ok(s) => s,
-                Err(_) => return false,
-            };
-        let Some(shm) = self.shm.as_ref() else {
+        let Some(mut canvas) = Canvas::new_bitmap(self.width, self.height) else {
             return false;
         };
-        let fd = file.as_fd();
-        let pool = shm.create_pool(fd, cap, &self.qh, ());
-        let buf = pool.create_buffer(
-            0,
-            buf_w,
-            buf_h,
-            stride,
-            wl_shm::Format::Argb8888,
-            &self.qh,
-            i,
-        );
-        self.frames[i].surface = Some(surface);
-        self.frames[i].file = Some(file);
-        self.frames[i].pool = Some(pool);
-        self.frames[i].buf = Some(buf);
-        self.frames[i].buf_w = buf_w;
-        self.frames[i].buf_h = buf_h;
-        self.frames[i].stride = stride;
-        true
+        canvas.clear();
+        let bar = self.measure_bar(&mut canvas);
+        self.paint(&mut canvas, &bar);
+        canvas.dump_ppm(path)
     }
 
     // ---- injection ----
@@ -1316,7 +921,7 @@ impl State {
         // the first pill); Shift+Tab passes through as a plain TAB.
         // By default Tab is a normal Tab key.
         if self.tab_accepts_prediction
-            && k.code == osk_core::key::key::KEY_TAB
+            && k.code == key::KEY_TAB
             && !shift_active
             && !self.predictor.suggestions().is_empty()
         {
@@ -1333,7 +938,6 @@ impl State {
         let Ok(n) = tap_events(&k, shift_active, caps, &sticky, &mut ev) else {
             return;
         };
-        use osk_core::key::key;
         for e in &ev[..n] {
             if e.press {
                 self.backend.press(e.code);
@@ -1367,8 +971,7 @@ impl State {
                 }
             }
         }
-        // A tap commits immediately, even with a frame callback in
-        // flight.
+        // A tap repaints immediately.
         self.render();
     }
 
@@ -1404,18 +1007,14 @@ impl State {
             self.rep_key = -1;
         }
         if self.moving {
-            // Relative motion (below) is the pointer's own delta and does
-            // not change when the surface moves. This surface-local sample
-            // is only the fallback for a compositor with no relative
-            // pointer.
-            if self.rel.is_none() {
-                let nx = (self.shown_x + (self.px - self.grab_lx)).max(0);
-                let ny = (self.shown_y + (self.py - self.grab_ly)).max(0);
-                if nx != self.pos_x || ny != self.pos_y {
-                    self.pos_x = nx;
-                    self.pos_y = ny;
-                    self.apply_geometry();
-                }
+            // `shown_*` is the window position at grab time; the pointer's
+            // window-local offset from the grab point is the drag delta.
+            let nx = (self.shown_x + (self.px - self.grab_lx)).max(0);
+            let ny = (self.shown_y + (self.py - self.grab_ly)).max(0);
+            if nx != self.pos_x || ny != self.pos_y {
+                self.pos_x = nx;
+                self.pos_y = ny;
+                self.apply_geometry();
             }
             return;
         }
@@ -1633,9 +1232,8 @@ impl State {
                 self.moving = true;
                 self.grab_lx = self.px;
                 self.grab_ly = self.py;
-                // Drop leftover subpixel motion from a previous drag.
-                self.drag_fx = 0.0;
-                self.drag_fy = 0.0;
+                self.shown_x = self.pos_x;
+                self.shown_y = self.pos_y;
                 return;
             }
             let Some(k) = self.key_at(self.px, self.py) else {
@@ -1702,49 +1300,6 @@ impl State {
         }
     }
 
-    /// Relative motion is device motion, not the change in surface-local
-    /// position. A drag that adds surface-local samples keeps counting
-    /// the same offset until the compositor applies the move, then the
-    /// next sample jumps backward.
-    fn on_relative_motion(&mut self, dx: f64, dy: f64) {
-        if !self.moving {
-            return;
-        }
-        self.drag_fx += dx;
-        self.drag_fy += dy;
-        let ix = self.drag_fx as i32;
-        let iy = self.drag_fy as i32;
-        if ix == 0 && iy == 0 {
-            return;
-        }
-        self.drag_fx -= ix as f64;
-        self.drag_fy -= iy as f64;
-        // Don't store the motion that the screen edge ate, or the window
-        // would have to be dragged back by that much before it moved
-        // again.
-        if self.pos_x + ix < 0 {
-            self.drag_fx = 0.0;
-        }
-        if self.pos_y + iy < 0 {
-            self.drag_fy = 0.0;
-        }
-        self.drag_by(ix, iy);
-    }
-
-    fn drag_by(&mut self, dx: i32, dy: i32) {
-        if dx == 0 && dy == 0 {
-            return;
-        }
-        let nx = (self.pos_x + dx).max(0);
-        let ny = (self.pos_y + dy).max(0);
-        if nx == self.pos_x && ny == self.pos_y {
-            return;
-        }
-        self.pos_x = nx;
-        self.pos_y = ny;
-        self.apply_geometry();
-    }
-
     // ---- repeat ----
 
     fn handle_repeat(&mut self) {
@@ -1772,56 +1327,11 @@ impl State {
         }
     }
 
-    /// Poll timeout: wait for events, or until the next repeat fires,
-    /// or until a held-back prefix expires.
-    fn rep_timeout(&self) -> Option<Duration> {
-        let mut dt: Option<u64> = None;
-        if self.rep_key >= 0 {
-            dt = Some(self.rep_next.saturating_sub(now_ms()));
-        }
-        if self.pressed >= 0 && !self.hold_fired {
-            let hold_fire = (self.press_time + 200).saturating_sub(now_ms());
-            dt = Some(dt.map_or(hold_fire, |d| d.min(hold_fire)));
-        }
-        if self.flash_key >= 0 {
-            let f = self.flash_until.saturating_sub(now_ms());
-            dt = Some(dt.map_or(f, |d| d.min(f)));
-        }
-        let dt = dt?;
-        Some(Duration::from_millis(dt.max(1)))
-    }
-
-    /// Frame-callback watchdog: if the compositor never fires the
-    /// callback for a bufferless geometry commit (some don't), don't
-    /// wait for it forever - force the pending commit on.
-    fn watchdog(&mut self) {
-        if !self.frame_pending || !self.dirty || now_ms() - self.last_commit_ms <= 100 {
-            return;
-        }
-        self.frame_pending = false;
-        if self.moving && self.width == self.attached_w && self.height == self.attached_h {
-            // Pure move: commit the new margin with the existing buffer.
-            self.dirty = false;
-            self.arm_frame();
-            if let Some(surf) = self.surface.as_ref() {
-                surf.commit();
-            }
-            self.commit_x = self.pos_x;
-            self.commit_y = self.pos_y;
-            self.last_commit_ms = now_ms();
-        } else {
-            self.dirty = false;
-            self.render();
-        }
-    }
-
-    // ---- layout switch ----
-
     // ---- painting ----
 
     /// Measure the bar elements (suggestions, layout, theme icon, close)
     /// and store their rects for hit testing.
-    fn measure_bar(&self, cr: &Context) -> BarLayout {
+    fn measure_bar(&self, cr: &mut Canvas) -> BarLayout {
         let mut bar = BarLayout {
             sugg: [Rect::default(); 5],
             n_sugg: 0,
@@ -2084,17 +1594,9 @@ impl State {
         bar
     }
 
-    fn paint(&self, cr: &Context, bar: &BarLayout) {
-        cr.identity_matrix();
+    fn paint(&self, cr: &mut Canvas, bar: &BarLayout) {
         cr.reset_clip();
-        let frame = &self.frames[self.cur_frame];
-        if self.width > 0 && self.height > 0 && frame.buf_w > 0 && frame.buf_h > 0 {
-            cr.scale(
-                frame.buf_w as f64 / self.width as f64,
-                frame.buf_h as f64 / self.height as f64,
-            );
-        }
-        cr.select_font_face(FONT, FontSlant::Normal, FontWeight::Normal);
+        cr.select_font_face(FONT, 0, 0);
         self.paint_window(cr);
         self.paint_bar(cr, bar);
         let layout = self.layout();
@@ -2106,7 +1608,6 @@ impl State {
         }
         self.paint_handle(cr);
         // A single hairline around the panel.
-        cr.set_operator(Operator::Over);
         cr.new_path();
         rrect(
             cr,
@@ -2127,11 +1628,7 @@ impl State {
         }
     }
 
-    fn paint_window(&self, cr: &Context) {
-        cr.set_operator(Operator::Source);
-        cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
-        let _ = cr.paint();
-        cr.set_operator(Operator::Over);
+    fn paint_window(&self, cr: &mut Canvas) {
         set_src_rgba(cr, self.theme.case, self.theme.opacity);
         rrect(
             cr,
@@ -2144,9 +1641,9 @@ impl State {
         let _ = cr.fill();
     }
 
-    fn draw_centered(&self, cr: &Context, s: &str, cx: f64, cy: f64, size: f64, color: u32) {
+    fn draw_centered(&self, cr: &mut Canvas, s: &str, cx: f64, cy: f64, size: f64, color: u32) {
         cr.set_font_size(size);
-        let Some(ext) = cr.text_extents(s).ok() else {
+        let Some(ext) = cr.text_extents(s) else {
             return;
         };
         set_src(cr, color);
@@ -2158,9 +1655,9 @@ impl State {
     }
 
     #[allow(dead_code)]
-    fn draw_left(&self, cr: &Context, s: &str, x: f64, cy: f64, size: f64, color: u32) {
+    fn draw_left(&self, cr: &mut Canvas, s: &str, x: f64, cy: f64, size: f64, color: u32) {
         cr.set_font_size(size);
-        let Some(ext) = cr.text_extents(s).ok() else {
+        let Some(ext) = cr.text_extents(s) else {
             return;
         };
         set_src(cr, color);
@@ -2168,12 +1665,12 @@ impl State {
         let _ = cr.show_text(s);
     }
 
-    fn text_w(&self, cr: &Context, s: &str, size: f64) -> f64 {
+    fn text_w(&self, cr: &mut Canvas, s: &str, size: f64) -> f64 {
         cr.set_font_size(size);
         cr.text_extents(s).map(|e| e.width()).unwrap_or(0.0)
     }
 
-    fn paint_chip(&self, cr: &Context, r: &Rect, label: &str, font_size: f64, bh: f64) {
+    fn paint_chip(&self, cr: &mut Canvas, r: &Rect, label: &str, font_size: f64, bh: f64) {
         if r.w <= 0.0 {
             return;
         }
@@ -2188,7 +1685,7 @@ impl State {
         self.draw_centered(cr, label, r.x + r.w / 2.0, bh / 2.0, font_size, fg);
     }
 
-    fn paint_bar(&self, cr: &Context, bar: &BarLayout) {
+    fn paint_bar(&self, cr: &mut Canvas, bar: &BarLayout) {
         let bh = self.bar_h();
         let k = self.k();
         let fs = 0.34 * k;
@@ -2197,11 +1694,9 @@ impl State {
         cr.clip();
         rrect(cr, 0.0, 0.0, self.width as f64, self.height as f64, CASE_RAD_U * k);
         cr.clip();
-        cr.set_operator(Operator::Source);
         set_src_rgba(cr, self.theme.case, self.theme.opacity);
         cr.rectangle(0.0, 0.0, self.width as f64, bh);
         let _ = cr.fill();
-        cr.set_operator(Operator::Over);
         let suggs = self.predictor.suggestions();
         let pad_y = 0.12 * bh;
         let ry = pad_y;
@@ -2247,8 +1742,8 @@ impl State {
                 let _ = cr.stroke();
             }
 
-            let weight = if is_primary { FontWeight::Bold } else { FontWeight::Normal };
-            cr.select_font_face(FONT, FontSlant::Normal, weight);
+            let weight = if is_primary { 1 } else { 0 };
+            cr.select_font_face(FONT, 0, weight);
             self.draw_centered(cr, word, rx + rw / 2.0, bh / 2.0, fs, fg);
         }
 
@@ -2293,7 +1788,14 @@ impl State {
         set_src(cr, th_bg);
         let _ = cr.fill();
         if th_active {
-            rrect(cr, bar.theme_rect.x + 0.5, pad_y + 0.5, bar.theme_rect.w - 1.0, chip_h - 1.0, chip_h * 0.35);
+            rrect(
+                cr,
+                bar.theme_rect.x + 0.5,
+                pad_y + 0.5,
+                bar.theme_rect.w - 1.0,
+                chip_h - 1.0,
+                chip_h * 0.35,
+            );
             set_src(cr, self.theme.accent);
             cr.set_line_width(1.0);
             let _ = cr.stroke();
@@ -2314,7 +1816,7 @@ impl State {
         let _ = cr.restore();
     }
 
-    fn draw_palette_icon(&self, cr: &Context, cx: f64, cy: f64, r: f64, color: u32) {
+    fn draw_palette_icon(&self, cr: &mut Canvas, cx: f64, cy: f64, r: f64, color: u32) {
         set_src(cr, color);
         cr.new_path();
         cr.arc(cx, cy, r, 0.0, 2.0 * std::f64::consts::PI);
@@ -2333,7 +1835,7 @@ impl State {
         }
     }
 
-    fn paint_theme_menu(&self, cr: &Context, bar: &BarLayout) {
+    fn paint_theme_menu(&self, cr: &mut Canvas, bar: &BarLayout) {
         if !self.theme_menu_open || bar.theme_menu_rect.w <= 0.0 {
             return;
         }
@@ -2406,8 +1908,8 @@ impl State {
             let _ = cr.fill();
 
             // Theme name rendered in that theme's accent/keytxt
-            let weight = if is_cur || hov { FontWeight::Bold } else { FontWeight::Normal };
-            cr.select_font_face(FONT, FontSlant::Normal, weight);
+            let weight = if is_cur || hov { 1 } else { 0 };
+            cr.select_font_face(FONT, 0, weight);
             cr.set_font_size(fs);
             let text_color = if is_cur { t.accent } else if hov { t.key_press } else { t.keytxt };
             self.draw_left(cr, t.name, rx + 20.0, ry + rh / 2.0, fs, text_color);
@@ -2421,7 +1923,7 @@ impl State {
         let _ = cr.restore();
     }
 
-    fn paint_dict_menu(&self, cr: &Context, bar: &BarLayout) {
+    fn paint_dict_menu(&self, cr: &mut Canvas, bar: &BarLayout) {
         if !self.dict_menu_open || bar.dict_menu_rect.w <= 0.0 {
             return;
         }
@@ -2462,7 +1964,7 @@ impl State {
         let _ = cr.stroke();
 
         // Header
-        cr.select_font_face(FONT, FontSlant::Normal, FontWeight::Bold);
+        cr.select_font_face(FONT, 0, 1);
         self.draw_left(
             cr,
             &format!("Learned Words ({total})"),
@@ -2494,7 +1996,7 @@ impl State {
             cr.set_line_width(1.0);
             let _ = cr.stroke();
         }
-        cr.select_font_face(FONT, FontSlant::Normal, if active { FontWeight::Bold } else { FontWeight::Normal });
+        cr.select_font_face(FONT, 0, if active { 1 } else { 0 });
         self.draw_centered(
             cr,
             if active { "Tab: Predict" } else { "Tab: Normal" },
@@ -2505,7 +2007,7 @@ impl State {
         );
 
         // Word rows
-        cr.select_font_face(FONT, FontSlant::Normal, FontWeight::Normal);
+        cr.select_font_face(FONT, 0, 0);
         if total == 0 {
             self.draw_centered(
                 cr,
@@ -2605,7 +2107,7 @@ impl State {
     }
 
     /// Three diagonal ticks in the bottom-right corner.
-    fn paint_handle(&self, cr: &Context) {
+    fn paint_handle(&self, cr: &mut Canvas) {
         let hs = self.handle_size() as f64;
         let hx = self.width as f64 - hs;
         let hy = self.height as f64 - hs;
@@ -2613,7 +2115,6 @@ impl State {
         let _ = cr.save();
         cr.rectangle(hx, hy, hs, hs);
         cr.clip();
-        cr.set_operator(Operator::Over);
         set_src(cr, if hov { 0x888888 } else { 0x555555 });
         for i in 0..3 {
             let off = 0.25 * hs * i as f64;
@@ -2626,7 +2127,7 @@ impl State {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint_key(&self, cr: &Context, rx: f64, ry: f64, rw: f64, rh: f64, key: &Key, idx: usize) {
+    fn paint_key(&self, cr: &mut Canvas, rx: f64, ry: f64, rw: f64, rh: f64, key: &Key, idx: usize) {
         // A code-0 key with no label is the 0.5u gap: nothing to draw.
         if key.code == 0 && key.label.is_none() {
             return;
@@ -2689,12 +2190,9 @@ impl State {
         cr.clip();
         rrect(cr, 0.0, 0.0, self.width as f64, self.height as f64, CASE_RAD_U * k);
         cr.clip();
-        // SOURCE so a stale neighbor pixel cannot show through the fill.
-        cr.set_operator(Operator::Source);
         set_src_rgba(cr, self.theme.case, self.theme.opacity);
         cr.rectangle(rx, ry, rw, rh);
         let _ = cr.fill();
-        cr.set_operator(Operator::Over);
         rrect(cr, cx, cy, cw, ch, KEY_RAD_U * k);
         let key_alpha = if self.theme.opacity < 1.0 {
             (self.theme.opacity + 0.08).min(1.0)
@@ -2731,479 +2229,100 @@ impl State {
         }
         let _ = cr.restore();
     }
-
-    fn ensure_rel(&mut self) {
-        if self.rel.is_some() {
-            return;
-        }
-        let (Some(mgr), Some(pointer)) = (self.rel_mgr.as_ref(), self.pointer.as_ref()) else {
-            return;
-        };
-        self.rel = Some(mgr.get_relative_pointer(pointer, &self.qh, ()));
-    }
 }
 
-// ---- Dispatch impls ----
+/// The keyboard state, shared with the window procedure through a raw
+/// pointer (the Win32 callback has no way to carry user data here).
+static mut STATE_PTR: *mut State = std::ptr::null_mut();
 
-impl Dispatch<wl_registry::WlRegistry, GlobalListContents, State> for State {
-    fn event(
-        _s: &mut State,
-        _p: &wl_registry::WlRegistry,
-        _e: wl_registry::Event,
-        _u: &GlobalListContents,
-        _c: &Connection,
-        _q: &QueueHandle<State>,
-    ) {
+/// Window procedure. `WM_MOUSEACTIVATE` returns `MA_NOACTIVATE` (3) so the
+/// OSK never takes keyboard focus from the active window.
+unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, _wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if STATE_PTR.is_null() {
+        return DefWindowProcW(hwnd, msg, _wparam, lparam);
     }
-}
-
-impl Dispatch<wl_compositor::WlCompositor, (), State> for State {
-    fn event(
-        _s: &mut State,
-        _p: &wl_compositor::WlCompositor,
-        _e: wl_compositor::Event,
-        _u: &(),
-        _c: &Connection,
-        _q: &QueueHandle<State>,
-    ) {
-    }
-}
-
-impl Dispatch<wl_surface::WlSurface, (), State> for State {
-    fn event(
-        state: &mut State,
-        _p: &wl_surface::WlSurface,
-        event: wl_surface::Event,
-        _u: &(),
-        _c: &Connection,
-        _q: &QueueHandle<State>,
-    ) {
-        if let wl_surface::Event::PreferredBufferScale { factor } = event {
-            // Fractional scale is authoritative. This integer event is
-            // the fallback for compositors that only advertise
-            // wl_surface v6.
-            if state.frac.is_none() && factor >= 1 {
-                state.scale_120 = factor * 120;
-                if state.ready {
-                    state.request_redraw();
-                }
-            }
-        }
-    }
-}
-
-impl Dispatch<wl_seat::WlSeat, (), State> for State {
-    fn event(
-        state: &mut State,
-        p: &wl_seat::WlSeat,
-        event: wl_seat::Event,
-        _u: &(),
-        _c: &Connection,
-        _q: &QueueHandle<State>,
-    ) {
-        if let wl_seat::Event::Capabilities { capabilities } = event {
-            if capabilities
-                .into_result()
-                .is_ok_and(|caps| caps.contains(wl_seat::Capability::Pointer))
-                && state.pointer.is_none()
-            {
-                eprintln!("[dbg] seat has pointer, creating WlPointer");
-                state.pointer = Some(p.get_pointer(&state.qh, ()));
-                state.ensure_rel();
-            }
-        }
-    }
-}
-
-impl Dispatch<wl_pointer::WlPointer, (), State> for State {
-    fn event(
-        state: &mut State,
-        _p: &wl_pointer::WlPointer,
-        event: wl_pointer::Event,
-        _u: &(),
-        _c: &Connection,
-        _q: &QueueHandle<State>,
-    ) {
-        match event {
-            wl_pointer::Event::Enter {
-                surface_x,
-                surface_y,
-                ..
-            } => {
-                eprintln!("[dbg] pointer ENTER at ({surface_x}, {surface_y})");
-                state.inside = true;
-                state.px = surface_x.round() as i32;
-                state.py = surface_y.round() as i32;
-                state.request_redraw();
-            }
-            wl_pointer::Event::Leave { .. } => {
-                // The button release is delivered to the surface under
-                // the pointer at release time. If the pointer left while
-                // the button was held, we never see it, so clear every
-                // press/drag flag or it sticks. Drag state is already
-                // committed by apply_geometry on each motion.
-                state.inside = false;
-                if state.pressed >= 0 {
-                    state.flash_key = state.pressed;
-                    state.flash_until = now_ms() + FLASH_MS;
-                }
-                state.pressed = -1;
-                state.rep_key = -1;
-                let was_drag = state.moving || state.resizing;
-                state.moving = false;
-                state.resizing = false;
-                if was_drag {
-                    state.save_config();
-                }
-                state.request_redraw();
-            }
-            wl_pointer::Event::Motion {
-                surface_x,
-                surface_y,
-                ..
-            } => {
-                state.px = surface_x.round() as i32;
-                state.py = surface_y.round() as i32;
-                state.on_motion();
-            }
-            wl_pointer::Event::Button {
-                button,
-                state: bstate,
-                ..
-            } if button == 1 || button == BTN_LEFT => {
-                // wlroots/Hyprland report the raw Linux code (BTN_LEFT=272);
-                // other compositors use the Wayland number (1). Accept both.
-                let pressed = bstate
-                    .into_result()
-                    .is_ok_and(|s| s == wl_pointer::ButtonState::Pressed);
-                state.on_button(pressed);
-            }
-            wl_pointer::Event::Button {
-                button,
-                state: bstate,
-                ..
-            } if button == 2 || button == 3 || button == BTN_RIGHT => {
-                // Wayland numbers 2/3 and the raw Linux code (BTN_RIGHT=273).
-                let pressed = bstate
-                    .into_result()
-                    .is_ok_and(|s| s == wl_pointer::ButtonState::Pressed);
-                if pressed {
-                    state.on_right_click();
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-impl Dispatch<wl_shm::WlShm, (), State> for State {
-    fn event(
-        _s: &mut State,
-        _p: &wl_shm::WlShm,
-        _e: wl_shm::Event,
-        _u: &(),
-        _c: &Connection,
-        _q: &QueueHandle<State>,
-    ) {
-    }
-}
-
-impl Dispatch<wl_shm_pool::WlShmPool, (), State> for State {
-    fn event(
-        _s: &mut State,
-        _p: &wl_shm_pool::WlShmPool,
-        _e: wl_shm_pool::Event,
-        _u: &(),
-        _c: &Connection,
-        _q: &QueueHandle<State>,
-    ) {
-    }
-}
-
-impl Dispatch<wl_buffer::WlBuffer, usize, State> for State {
-    fn event(
-        state: &mut State,
-        _p: &wl_buffer::WlBuffer,
-        _e: wl_buffer::Event,
-        udata: &usize,
-        _c: &Connection,
-        _q: &QueueHandle<State>,
-    ) {
-        state.frames[*udata].attached = false;
-        // render() bails when both buffers are busy and sets dirty. The
-        // release is the signal that a buffer can be painted again.
-        if state.dirty && !state.frame_pending && state.ready {
-            state.request_redraw();
-        }
-    }
-}
-
-impl Dispatch<wl_callback::WlCallback, u32, State> for State {
-    fn event(
-        state: &mut State,
-        _p: &wl_callback::WlCallback,
-        _e: wl_callback::Event,
-        gen: &u32,
-        _c: &Connection,
-        _q: &QueueHandle<State>,
-    ) {
-        if *gen != state.frame_gen {
-            return;
-        }
-        state.frame_pending = false;
-        state.presented = true;
-        if debug() {
-            eprintln!(
-                "ui present {}x{} scale {}/120",
-                state.width, state.height, state.scale_120
-            );
-        }
-        // This callback is the present of the commit that stored
-        // commit_*; pointer samples from here on are in that space.
-        state.shown_x = state.commit_x;
-        state.shown_y = state.commit_y;
-        if !state.dirty {
-            return;
-        }
-        state.dirty = false;
-        if state.moving && state.width == state.attached_w && state.height == state.attached_h {
-            // Buffer content did not change. Commit the latest margin;
-            // the callback is part of this commit so the next present
-            // wakes us.
-            state.arm_frame();
-            if let Some(surf) = state.surface.as_ref() {
-                surf.commit();
-            }
-            state.commit_x = state.pos_x;
-            state.commit_y = state.pos_y;
-            state.last_commit_ms = now_ms();
-        } else {
+    let state = &mut *STATE_PTR;
+    match msg {
+        WM_MOUSEACTIVATE => LRESULT(3),
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            BeginPaint(hwnd, &mut ps);
             state.render();
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
         }
-    }
-}
-
-impl Dispatch<wl_region::WlRegion, (), State> for State {
-    fn event(
-        _s: &mut State,
-        _p: &wl_region::WlRegion,
-        _e: wl_region::Event,
-        _u: &(),
-        _c: &Connection,
-        _q: &QueueHandle<State>,
-    ) {
-    }
-}
-
-impl Dispatch<ZwlrLayerShellV1, (), State> for State {
-    fn event(
-        _s: &mut State,
-        _p: &ZwlrLayerShellV1,
-        _e: wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Event,
-        _u: &(),
-        _c: &Connection,
-        _q: &QueueHandle<State>,
-    ) {
-    }
-}
-
-impl Dispatch<ZwlrLayerSurfaceV1, (), State> for State {
-    fn event(
-        state: &mut State,
-        p: &ZwlrLayerSurfaceV1,
-        event: wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Event,
-        _u: &(),
-        _c: &Connection,
-        _q: &QueueHandle<State>,
-    ) {
-        use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Event;
-        match event {
-            Event::Configure {
-                serial,
-                width,
-                height,
-            } => {
-                p.ack_configure(serial);
-                // use our requested size (the hint is advisory)
-                if state.width > 0 && state.height > 0 {
-                    if width != state.width as u32 || height != state.height as u32 {
-                        state.width = if width > 0 { width as i32 } else { state.width };
-                        state.height = if height > 0 {
-                            height as i32
-                        } else {
-                            state.height
-                        };
-                    }
-                } else {
-                    state.width = if width > 0 { width as i32 } else { 720 };
-                    state.height = if height > 0 { height as i32 } else { 340 };
-                }
-                state.ready = true;
+        WM_TIMER => {
+            state.handle_repeat();
+            state.handle_flash();
+            state.handle_hold();
+            state.backend.pump();
+            if state.quit {
+                let _ = DestroyWindow(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            let x = (lparam.0 & 0xffff) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+            state.px = x;
+            state.py = y;
+            state.inside = x >= 0 && x < state.width && y >= 0 && y < state.height;
+            state.on_motion();
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            SetCapture(hwnd);
+            let x = (lparam.0 & 0xffff) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+            state.px = x;
+            state.py = y;
+            state.inside = true;
+            state.on_button(true);
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            let _ = ReleaseCapture();
+            let x = (lparam.0 & 0xffff) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+            state.px = x;
+            state.py = y;
+            state.on_button(false);
+            LRESULT(0)
+        }
+        WM_RBUTTONDOWN => {
+            let x = (lparam.0 & 0xffff) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+            state.px = x;
+            state.py = y;
+            state.on_right_click();
+            LRESULT(0)
+        }
+        WM_SIZE => {
+            let w = lparam.0 as u16 as i32;
+            let h = (lparam.0 >> 16) as u16 as i32;
+            if w != state.width || h != state.height {
+                state.width = w;
+                state.height = h;
+                state.dirty = true;
                 state.request_redraw();
             }
-            Event::Closed => {
-                state.save_config();
-                state.quit = true;
-            }
-            _ => {}
+            LRESULT(0)
         }
-    }
-}
-
-impl Dispatch<WpFractionalScaleManagerV1, (), State> for State {
-    fn event(
-        _s: &mut State,
-        _p: &WpFractionalScaleManagerV1,
-        _e: wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::Event,
-        _u: &(),
-        _c: &Connection,
-        _q: &QueueHandle<State>,
-    ) {
-    }
-}
-
-impl Dispatch<WpFractionalScaleV1, (), State> for State {
-    fn event(
-        state: &mut State,
-        _p: &WpFractionalScaleV1,
-        event: wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1::Event,
-        _u: &(),
-        _c: &Connection,
-        _q: &QueueHandle<State>,
-    ) {
-        use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1::Event;
-        if let Event::PreferredScale { scale } = event {
-            state.scale_120 = (scale as i32).max(1);
-            if state.ready {
-                state.request_redraw();
-            }
+        WM_DESTROY => {
+            state.quit = true;
+            PostQuitMessage(0);
+            LRESULT(0)
         }
+        _ => DefWindowProcW(hwnd, msg, _wparam, lparam),
     }
 }
 
-impl Dispatch<WpViewporter, (), State> for State {
-    fn event(
-        _s: &mut State,
-        _p: &WpViewporter,
-        _e: wayland_protocols::wp::viewporter::client::wp_viewporter::Event,
-        _u: &(),
-        _c: &Connection,
-        _q: &QueueHandle<State>,
-    ) {
-    }
-}
-
-impl Dispatch<WpViewport, (), State> for State {
-    fn event(
-        _s: &mut State,
-        _p: &WpViewport,
-        _e: wayland_protocols::wp::viewporter::client::wp_viewport::Event,
-        _u: &(),
-        _c: &Connection,
-        _q: &QueueHandle<State>,
-    ) {
-    }
-}
-
-impl Dispatch<ZwpRelativePointerManagerV1, (), State> for State {
-    fn event(
-        _s: &mut State,
-        _p: &ZwpRelativePointerManagerV1,
-        _e: wayland_protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_manager_v1::Event,
-        _u: &(),
-        _c: &Connection,
-        _q: &QueueHandle<State>,
-    ) {
-    }
-}
-
-impl Dispatch<ZwpRelativePointerV1, (), State> for State {
-    fn event(
-        state: &mut State,
-        _p: &ZwpRelativePointerV1,
-        event: wayland_protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_v1::Event,
-        _u: &(),
-        _c: &Connection,
-        _q: &QueueHandle<State>,
-    ) {
-        use wayland_protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_v1::Event;
-        if let Event::RelativeMotion { dx, dy, .. } = event {
-            state.on_relative_motion(dx, dy);
-        }
-    }
-}
-
-/// The layer-shell UI. Runs until the keyboard is closed or the display
-/// disconnects.
+/// The Win32 UI. Runs until the keyboard is closed or the window is
+/// destroyed.
 pub fn run(backend: Box<dyn Backend>) -> i32 {
-    let conn = match Connection::connect_to_env() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("osk: no wayland display: {e}");
-            return 1;
-        }
-    };
-    let (globals, mut sq) = match registry_queue_init::<State>(&conn) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("osk: registry init failed: {e}");
-            return 1;
-        }
-    };
-    let qh = sq.handle();
-    let mut state = State::new(backend, qh.clone());
+    let mut state = Box::new(State::new(backend));
 
-    // Bind the globals we need.
-    let comp: wl_compositor::WlCompositor = match globals.bind(&qh, 1..=7, ()) {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("osk: no wl_compositor");
-            return 1;
-        }
-    };
-    let shm: wl_shm::WlShm = match globals.bind(&qh, 1..=1, ()) {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("osk: no wl_shm");
-            return 1;
-        }
-    };
-    let layer_shell: ZwlrLayerShellV1 = match globals.bind(&qh, 1..=4, ()) {
-        Ok(l) => l,
-        Err(_) => {
-            eprintln!("osk: no zwlr_layer_shell_v1");
-            return 1;
-        }
-    };
-    state.comp = Some(comp.clone());
-    state.shm = Some(shm);
-    state.layer_shell = Some(layer_shell.clone());
-    state.seat = globals.bind(&qh, 1..=7, ()).ok();
-    state.frac_mgr = globals.bind(&qh, 1..=1, ()).ok();
-    state.viewporter = globals.bind(&qh, 1..=1, ()).ok();
-    state.rel_mgr = globals.bind(&qh, 1..=1, ()).ok();
-
-    // Create the surface and its role objects.
-    let surface = comp.create_surface(&qh, ());
-    state.surface = Some(surface.clone());
-    if let Some(mgr) = state.frac_mgr.as_ref() {
-        state.frac = Some(mgr.get_fractional_scale(&surface, &qh, ()));
-    }
-    if let Some(vp) = state.viewporter.as_ref() {
-        state.viewport = Some(vp.get_viewport(&surface, &qh, ()));
-    }
-    // Pick up the preferred scale before the first buffer, so the first
-    // frame is already at the output scale instead of a blurry 1x upload.
-    let _ = sq.roundtrip(&mut state);
-
-    let layer =
-        layer_shell.get_layer_surface(&surface, None, Layer::Top, "osk".to_string(), &qh, ());
-    state.layer = Some(layer.clone());
-    // Never take keyboard focus: keys always go to the user's focused
-    // window.
-    layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-
-    // Default size: 1u = U0 pixels, like the reference keyboard (if no valid saved size).
+    // Default size: 1u = U0 pixels (if no valid saved size).
     let rows = state.layout().rows.len() as f64;
     if state.width < MIN_W {
         state.width = ((state.grid_cols as f64 / 20.0 + 2.0 * MARGIN_U) * U0 + 0.5) as i32;
@@ -3211,89 +2330,75 @@ pub fn run(backend: Box<dyn Backend>) -> i32 {
     if state.height < MIN_H {
         state.height = ((BAR_U + rows + 2.0 * MARGIN_U) * U0 + 0.5) as i32;
     }
-    state.apply_geometry();
 
-    // Event loop: poll the connection fd with a timeout so key repeat
-    // fires even when no compositor events arrive (the C reference
-    // polls with repeat_timeout(); blocking_dispatch alone would sleep
-    // forever with a held key).
-    let mut poller = match mio::Poll::new() {
-        Ok(p) => p,
+    let class_name: Vec<u16> = "osk-win-window\0".encode_utf16().collect();
+    let title: Vec<u16> = "OSK\0".encode_utf16().collect();
+    let hinst = match unsafe { GetModuleHandleW(None) } {
+        Ok(h) => h,
         Err(e) => {
-            eprintln!("osk: poll init failed: {e}");
+            eprintln!("osk: GetModuleHandleW failed: {e}");
             return 1;
         }
     };
-    {
-        let raw = conn.as_fd().as_raw_fd();
-        let mut src = mio::unix::SourceFd(&raw);
-        if let Err(e) = poller
-            .registry()
-            .register(&mut src, WL_TOKEN, mio::Interest::READABLE)
-        {
-            eprintln!("osk: poll register failed: {e}");
+    let wc = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        style: CS_HREDRAW | CS_VREDRAW,
+        lpfnWndProc: Some(wnd_proc),
+        hInstance: HINSTANCE(hinst.0),
+        lpszClassName: PCWSTR::from_raw(class_name.as_ptr()),
+        ..Default::default()
+    };
+    let atom = unsafe { RegisterClassExW(&wc) };
+    if atom == 0 {
+        eprintln!("osk: RegisterClassExW failed");
+        return 1;
+    }
+    unsafe {
+        STATE_PTR = &mut *state as *mut State;
+    }
+    let hwnd = match unsafe {
+        CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            PCWSTR::from_raw(class_name.as_ptr()),
+            PCWSTR::from_raw(title.as_ptr()),
+            WS_POPUP,
+            state.pos_x,
+            state.pos_y,
+            state.width,
+            state.height,
+            None,
+            None,
+            Some(HINSTANCE(hinst.0)),
+            None,
+        )
+    } {
+        Ok(h) => h,
+        Err(e) => {
+            unsafe { STATE_PTR = std::ptr::null_mut(); }
+            eprintln!("osk: CreateWindowExW failed: {e}");
             return 1;
         }
+    };
+    state.hwnd = hwnd.0 as isize;
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        SetTimer(Some(hwnd), 1, 16, None);
     }
-    let mut events = mio::Events::with_capacity(4);
-    loop {
-        state.handle_repeat();
-        state.handle_flash();
-        state.handle_hold();
+    let mut msg = MSG::default();
+    while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
         if state.quit {
             break;
         }
-        state.watchdog();
-        if let Err(e) = conn.flush() {
-            eprintln!("osk: display flush error: {e}");
-            break;
-        }
-        // prepare_read must be created before polling the fd.
-        let guard = conn.prepare_read();
-        if guard.is_none() {
-            // Events are already in the queue; dispatch and loop.
-            if let Err(e) = sq.dispatch_pending(&mut state) {
-                eprintln!("osk: display connection error: {e}");
-                break;
-            }
-            continue;
-        }
-        let guard = guard.unwrap();
-        let mut wl_ready = events.iter().any(|e| e.token() == WL_TOKEN);
-        if !wl_ready {
-            if let Err(e) = poller.poll(&mut events, state.rep_timeout()) {
-                if e.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                eprintln!("osk: poll error: {e}");
-                break;
-            }
-        }
-        wl_ready = events.iter().any(|e| e.token() == WL_TOKEN);
-        if wl_ready {
-            if let Err(e) = guard.read() {
-                let io_err = match e {
-                    WaylandError::Io(e) => e,
-                    other => {
-                        eprintln!("osk: display read error: {other:?}");
-                        break;
-                    }
-                };
-                // Spurious readiness: nothing to read yet.
-                if io_err.kind() != std::io::ErrorKind::WouldBlock {
-                    eprintln!("osk: display read error: {io_err}");
-                    break;
-                }
-            }
-        }
-        events.clear();
-        if let Err(e) = sq.dispatch_pending(&mut state) {
-            eprintln!("osk: display connection error: {e}");
-            break;
-        }
-        state.backend.pump();
     }
-
+    unsafe {
+        let _ = KillTimer(Some(hwnd), 1);
+        let _ = DestroyWindow(hwnd);
+        STATE_PTR = std::ptr::null_mut();
+    }
     state.save_config();
     state.backend.destroy();
     0

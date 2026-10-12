@@ -51,6 +51,7 @@ struct BITMAPINFO {
     bmi_header: BITMAPINFOHEADER,
 }
 
+#[allow(dead_code)]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct LOGFONTW {
@@ -75,6 +76,7 @@ const SRCCOPY: u32 = 0x00CC0020;
 const BI_RGB: u32 = 0;
 const DIB_RGB_COLORS: u32 = 0;
 const PS_SOLID: i32 = 0;
+#[allow(dead_code)]
 const NULL_PEN: i32 = 5;
 const FW_NORMAL: i32 = 400;
 const FW_BOLD: i32 = 700;
@@ -83,6 +85,7 @@ const OUT_DEFAULT_PRECIS: u8 = 0;
 const CLIP_DEFAULT_PRECIS: u8 = 0;
 const DEFAULT_QUALITY: u8 = 0;
 const DEFAULT_PITCH: u8 = 0;
+#[allow(dead_code)]
 const OBJ_FONT: i32 = 7;
 const NULL_BRUSH: i32 = 5;
 
@@ -97,6 +100,7 @@ enum Shape {
 
 #[link(name = "gdi32")]
 extern "system" {
+    fn GdiFlush() -> i32;
     fn CreateCompatibleDC(hdc: HDC) -> HDC;
     fn DeleteDC(hdc: HDC) -> i32;
     fn CreateDIBSection(
@@ -133,6 +137,7 @@ extern "system" {
     ) -> i32;
     fn CreateSolidBrush(color: u32) -> HGDIOBJ;
     fn CreatePen(style: i32, width: i32, color: u32) -> HGDIOBJ;
+    fn GetStockObject(i: i32) -> HGDIOBJ;
     fn CreateFontW(
         height: i32,
         width: i32,
@@ -369,7 +374,7 @@ impl Canvas {
                     } else {
                         let pen = CreatePen(PS_SOLID, self.line_width, self.color);
                         let ob_pen = SelectObject(self.mem_dc, pen);
-                        let ob_br = SelectObject(self.mem_dc, NULL_BRUSH as HGDIOBJ);
+                        let ob_br = SelectObject(self.mem_dc, GetStockObject(NULL_BRUSH));
                         RoundRect(self.mem_dc, x, y, x + w, y + h, rad * 2, rad * 2);
                         SelectObject(self.mem_dc, ob_pen);
                         SelectObject(self.mem_dc, ob_br);
@@ -550,6 +555,9 @@ impl Canvas {
 
     /// Write the back buffer to a binary PPM (for verification).
     pub fn dump_ppm(&self, path: &str) -> bool {
+        unsafe {
+            GdiFlush();
+        }
         let mut out = Vec::with_capacity(3 * self.w as usize * self.h as usize + 32);
         out.extend_from_slice(format!("P6\n{} {}\n255\n", self.w, self.h).as_bytes());
         unsafe {

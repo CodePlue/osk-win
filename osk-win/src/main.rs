@@ -1,17 +1,34 @@
-//! osk-win: the Wayland on-screen keyboard ported to Windows.
+//! osk-win: the on-screen keyboard for Windows.
 //!
-//! Subcommands:
-//! - (default): launch the OSK UI (topmost, non-activating).
+//! A topmost, non-activating Win32 window that draws the keyboard with GDI
+//! and injects keys via SendInput.
+//!
+//! Modes:
+//! - (default): launch the OSK UI.
+//! - `--type <text>`: inject a string via the backend and exit.
 //! - `canvas-test`: render a test scene with the GDI canvas and dump a PPM.
+//! - `ui-screenshot`: render the keyboard to a PPM (headless) and exit.
 
+mod backend;
 mod gdip;
+pub mod ui;
+mod vk;
 
 use clap::{Parser, Subcommand};
 use gdip::Canvas;
+use oskwin_core::typekey::{type_string, CharMap};
+
+use backend::{Backend, BackendSink, SendInputBackend};
 
 #[derive(Parser)]
 #[command(name = "osk-win")]
 struct Cli {
+    /// Inject this string via the backend and exit.
+    #[arg(long)]
+    r#type: Option<String>,
+    /// Injection backend to use.
+    #[arg(long, default_value = "sendinput")]
+    backend: String,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -24,20 +41,84 @@ enum Cmd {
         #[arg(long, default_value = "C:/osk_canvas_test.ppm")]
         out: String,
     },
+    /// Render the keyboard to a PPM (headless) and exit.
+    UiScreenshot {
+        /// Output PPM path.
+        #[arg(long, default_value = "C:/osk_ui.ppm")]
+        out: String,
+    },
 }
 
 fn main() {
     let cli = Cli::parse();
-    let rc = match cli.cmd {
-        None => run_ui(),
-        Some(Cmd::CanvasTest { out }) => run_canvas_test(&out),
+    let rc = if let Some(text) = cli.r#type {
+        run_type(&text, &cli.backend)
+    } else {
+        match cli.cmd {
+            Some(Cmd::CanvasTest { out }) => run_canvas_test(&out),
+            Some(Cmd::UiScreenshot { out }) => run_ui_screenshot(&out, &cli.backend),
+            None => run_ui(&cli.backend),
+        }
     };
     std::process::exit(rc);
 }
 
-fn run_ui() -> i32 {
-    eprintln!("osk-win UI: not yet ported (canvas-test works)");
-    1
+fn make_backend(name: &str) -> Option<Box<dyn Backend>> {
+    match name {
+        "sendinput" => Some(Box::new(SendInputBackend)),
+        _ => None,
+    }
+}
+
+fn run_type(text: &str, backend_name: &str) -> i32 {
+    let Some(mut backend) = make_backend(backend_name) else {
+        eprintln!("osk: unknown backend {backend_name:?}");
+        return 1;
+    };
+    if let Err(e) = backend.init() {
+        eprintln!("osk: backend init failed: {e}");
+        return 1;
+    }
+    let Some(map) = CharMap::new() else {
+        eprintln!("osk: no charmap");
+        return 1;
+    };
+    let mut sink = BackendSink { b: &mut *backend };
+    let result = type_string(&mut sink, &map, text, || {});
+    backend.destroy();
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("osk: type failed: {e:?}");
+            1
+        }
+    }
+}
+
+fn run_ui(backend_name: &str) -> i32 {
+    let Some(mut backend) = make_backend(backend_name) else {
+        eprintln!("osk: unknown backend {backend_name:?}");
+        return 1;
+    };
+    if let Err(e) = backend.init() {
+        eprintln!("osk: backend init failed: {e}");
+        return 1;
+    }
+    ui::run(backend)
+}
+
+fn run_ui_screenshot(out: &str, backend_name: &str) -> i32 {
+    let Some(backend) = make_backend(backend_name) else {
+        eprintln!("osk: unknown backend {backend_name:?}");
+        return 1;
+    };
+    let mut state = ui::State::new(backend);
+    if !state.render_to_ppm(out) {
+        eprintln!("FAIL: render_to_ppm failed");
+        return 1;
+    }
+    println!("wrote {}", out);
+    0
 }
 
 fn run_canvas_test(out: &str) -> i32 {
