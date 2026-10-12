@@ -1,0 +1,10 @@
+# Cross-compile to Windows from Linux.
+#
+# The linker is set by toolchain.sh (CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER
+# -> winlink.sh), which forces the Windows PE target so clang uses lld.
+# Always source toolchain.sh (or use build.sh / run.sh) before building.
+#
+# Toolchain (all per-user, no root):
+#   * rustup    -> ~/.rustup  (stable + x86_64-pc-windows-gnu std)
+#   * llvm-mingw-> ~/llvm-mingw (Linux-native clang that emits PE)
+#   * winlibs   -> ~/mingw    (supplies libgcc.a / libgcc_eh.a)

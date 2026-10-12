@@ -1,0 +1,16 @@
+[package]
+name = "oskwin-core"
+description = "Pure logic for the osk-win Windows on-screen keyboard: layouts, modifier engine, tap events, n-gram word prediction, and char-to-key mapping. No Win32, no GUI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+parking_lot = { workspace = true }
+
+# The neural LLM predictor is deferred in this project. The feature exists so
+# the vendored neural.rs cfg conditions are valid; it compiles to a no-op
+# stub and the n-gram predictor is used unmodified.
+[features]
+neural = []

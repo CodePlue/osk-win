@@ -1,0 +1,12 @@
+[package]
+name = "oskwin-verify"
+description = "Verification tools for osk-win: a focused recv window that logs keystrokes, and a click injector."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+clap = { workspace = true }
+windows = { workspace = true }
+parking_lot = { workspace = true }
