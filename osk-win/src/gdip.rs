@@ -152,7 +152,9 @@ extern "system" {
         rop: u32,
     ) -> i32;
     fn FillRect(hdc: HDC, lprc: *const RECT, hbr: HGDIOBJ) -> i32;
-    fn FrameRect(hdc: HDC, lprc: *const RECT, hpen: HGDIOBJ) -> i32;
+    fn Rectangle(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32) -> i32;
+    fn MoveToEx(hdc: HDC, x: i32, y: i32, lppt: *mut POINT) -> i32;
+    fn LineTo(hdc: HDC, x: i32, y: i32) -> i32;
     fn RoundRect(
         hdc: HDC,
         left: i32,
@@ -236,6 +238,7 @@ pub struct Canvas {
     font_bold: bool,
     cur_x: i32,
     cur_y: i32,
+    lines: Vec<(i32, i32, i32, i32)>,
     shape: Shape,
     states: Vec<i32>,
 }
@@ -293,6 +296,7 @@ impl Canvas {
             font_bold: false,
             cur_x: 0,
             cur_y: 0,
+            lines: Vec::new(),
             shape: Shape::None,
             states: Vec::new(),
         })
@@ -368,7 +372,11 @@ impl Canvas {
                         DeleteObject(br);
                     } else {
                         let pen = CreatePen(PS_SOLID, self.line_width, self.color);
-                        FrameRect(self.mem_dc, &rc, pen);
+                        let ob_pen = SelectObject(self.mem_dc, pen);
+                        let ob_br = SelectObject(self.mem_dc, GetStockObject(NULL_BRUSH));
+                        Rectangle(self.mem_dc, x, y, x + w, y + h);
+                        SelectObject(self.mem_dc, ob_pen);
+                        SelectObject(self.mem_dc, ob_br);
                         DeleteObject(pen);
                     }
                 }
@@ -426,6 +434,22 @@ impl Canvas {
         }
     }
 
+    fn render_lines(&self) {
+        if self.lines.is_empty() {
+            return;
+        }
+        unsafe {
+            let pen = CreatePen(PS_SOLID, self.line_width, self.color);
+            let ob_pen = SelectObject(self.mem_dc, pen);
+            for &(x1, y1, x2, y2) in &self.lines {
+                MoveToEx(self.mem_dc, x1, y1, ptr::null_mut());
+                LineTo(self.mem_dc, x2, y2);
+            }
+            SelectObject(self.mem_dc, ob_pen);
+            DeleteObject(pen);
+        }
+    }
+
     // ---- Cairo-compatible surface ----
 
     pub fn set_source_rgba(&mut self, r: f64, g: f64, b: f64, a: f64) {
@@ -438,11 +462,12 @@ impl Canvas {
     }
 
     pub fn set_line_width(&mut self, w: f64) {
-        self.line_width = (w as i32).max(1);
+        self.line_width = (w.round() as i32).max(1);
     }
 
     pub fn new_path(&mut self) {
         self.shape = Shape::None;
+        self.lines.clear();
     }
 
     #[allow(dead_code)]
@@ -455,11 +480,17 @@ impl Canvas {
     pub fn close_path(&mut self) {}
 
     pub fn move_to(&mut self, x: f64, y: f64) {
-        self.cur_x = x as i32;
-        self.cur_y = y as i32;
+        self.cur_x = x.round() as i32;
+        self.cur_y = y.round() as i32;
     }
 
-    pub fn line_to(&mut self, _x: f64, _y: f64) {}
+    pub fn line_to(&mut self, x: f64, y: f64) {
+        let x2 = x.round() as i32;
+        let y2 = y.round() as i32;
+        self.lines.push((self.cur_x, self.cur_y, x2, y2));
+        self.cur_x = x2;
+        self.cur_y = y2;
+    }
 
     pub fn arc(&mut self, cx: f64, cy: f64, r: f64, _a1: f64, _a2: f64) {
         self.shape = Shape::Circle {
@@ -492,10 +523,15 @@ impl Canvas {
 
     pub fn fill(&mut self) {
         self.render_shape(true);
+        self.shape = Shape::None;
+        self.lines.clear();
     }
 
     pub fn stroke(&mut self) {
         self.render_shape(false);
+        self.render_lines();
+        self.shape = Shape::None;
+        self.lines.clear();
     }
 
     pub fn clip(&mut self) {
@@ -509,6 +545,8 @@ impl Canvas {
                 }
             }
         }
+        self.shape = Shape::None;
+        self.lines.clear();
     }
 
     fn shape_bbox(&self) -> Option<(i32, i32, i32, i32)> {
