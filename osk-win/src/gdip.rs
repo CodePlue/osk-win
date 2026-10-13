@@ -89,6 +89,25 @@ const DEFAULT_PITCH: u8 = 0;
 const OBJ_FONT: i32 = 7;
 const NULL_BRUSH: i32 = 5;
 
+static EMBEDDED_FONT: &[u8] = include_bytes!("../assets/AdwaitaSans-Regular.ttf");
+static FONT_HANDLE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Registers the embedded Adwaita Sans font into GDI's process font table.
+pub fn ensure_embedded_font() {
+    FONT_HANDLE.get_or_init(|| {
+        let mut count = 0u32;
+        let h = unsafe {
+            AddFontMemResourceEx(
+                EMBEDDED_FONT.as_ptr() as *const c_void,
+                EMBEDDED_FONT.len() as u32,
+                ptr::null_mut(),
+                &mut count,
+            )
+        };
+        h as usize
+    });
+}
+
 /// A shape being built before fill/stroke.
 #[derive(Clone, Copy, Default)]
 enum Shape {
@@ -96,11 +115,19 @@ enum Shape {
     None,
     Rect { x: i32, y: i32, w: i32, h: i32 },
     RRect { x: i32, y: i32, w: i32, h: i32, rad: i32 },
+    Circle { cx: i32, cy: i32, r: i32 },
 }
 
 #[link(name = "gdi32")]
 extern "system" {
     fn GdiFlush() -> i32;
+    fn AddFontMemResourceEx(
+        p_file_view: *const c_void,
+        cj_size: u32,
+        pv_reserved: *mut c_void,
+        p_num_fonts: *mut u32,
+    ) -> *mut c_void;
+    fn Ellipse(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32) -> i32;
     fn CreateCompatibleDC(hdc: HDC) -> HDC;
     fn DeleteDC(hdc: HDC) -> i32;
     fn CreateDIBSection(
@@ -272,8 +299,9 @@ impl Canvas {
     }
 
     fn make_font(size: f32, bold: bool) -> HFONT {
+        ensure_embedded_font();
         let mut face = [0u16; 32];
-        let name: Vec<u16> = "Segoe UI".encode_utf16().collect();
+        let name: Vec<u16> = "Adwaita Sans".encode_utf16().collect();
         for (i, c) in name.iter().enumerate() {
             if i < 31 {
                 face[i] = *c;
@@ -368,6 +396,33 @@ impl Canvas {
                     }
                 }
             }
+            Shape::Circle { cx, cy, r } => {
+                let left = cx - r;
+                let top = cy - r;
+                let right = cx + r + 1;
+                let bottom = cy + r + 1;
+                unsafe {
+                    if fill {
+                        let br = CreateSolidBrush(self.color);
+                        let pen = CreatePen(PS_SOLID, 1, self.color);
+                        let ob_br = SelectObject(self.mem_dc, br);
+                        let ob_pen = SelectObject(self.mem_dc, pen);
+                        Ellipse(self.mem_dc, left, top, right, bottom);
+                        SelectObject(self.mem_dc, ob_br);
+                        SelectObject(self.mem_dc, ob_pen);
+                        DeleteObject(br);
+                        DeleteObject(pen);
+                    } else {
+                        let pen = CreatePen(PS_SOLID, self.line_width, self.color);
+                        let ob_pen = SelectObject(self.mem_dc, pen);
+                        let ob_br = SelectObject(self.mem_dc, GetStockObject(NULL_BRUSH));
+                        Ellipse(self.mem_dc, left, top, right, bottom);
+                        SelectObject(self.mem_dc, ob_pen);
+                        SelectObject(self.mem_dc, ob_br);
+                        DeleteObject(pen);
+                    }
+                }
+            }
         }
     }
 
@@ -406,8 +461,13 @@ impl Canvas {
 
     pub fn line_to(&mut self, _x: f64, _y: f64) {}
 
-    /// No-op: rounded rects are set directly via `rrect`.
-    pub fn arc(&mut self, _cx: f64, _cy: f64, _r: f64, _a1: f64, _a2: f64) {}
+    pub fn arc(&mut self, cx: f64, cy: f64, r: f64, _a1: f64, _a2: f64) {
+        self.shape = Shape::Circle {
+            cx: cx.round() as i32,
+            cy: cy.round() as i32,
+            r: (r.round() as i32).max(1),
+        };
+    }
 
     /// Directly set the current shape to a rounded rectangle (used by the
     /// ported `rrect` helper).
@@ -455,6 +515,7 @@ impl Canvas {
         match self.shape {
             Shape::Rect { x, y, w, h } => Some((x, y, w, h)),
             Shape::RRect { x, y, w, h, .. } => Some((x, y, w, h)),
+            Shape::Circle { cx, cy, r } => Some((cx - r, cy - r, 2 * r + 1, 2 * r + 1)),
             Shape::None => None,
         }
     }

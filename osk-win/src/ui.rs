@@ -55,7 +55,7 @@ const FLASH_MS: u64 = 150;
 
 // Sans-serif face for the labels; it carries every glyph we draw
 // (letters, digits, and the arrow/symbol caps) in one font.
-const FONT: &str = "Segoe UI";
+const FONT: &str = "Adwaita Sans";
 
 #[derive(Clone, Copy, Debug)]
 pub struct Theme {
@@ -645,6 +645,7 @@ pub struct State {
 
 impl State {
     pub fn new(backend: Box<dyn Backend>) -> Self {
+        crate::gdip::ensure_embedded_font();
         let config = PersistentConfig::load();
         let initial_theme_idx = std::env::var("OSK_THEME")
             .ok()
