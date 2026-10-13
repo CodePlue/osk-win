@@ -6,11 +6,23 @@
 
 use oskwin_core::typekey::KeySink;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
-    VIRTUAL_KEY,
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VIRTUAL_KEY,
 };
 
 use crate::vk;
+
+fn is_extended_vk(vk: u16) -> bool {
+    matches!(
+        vk,
+        0x21..=0x28 // Page Up, Page Down, End, Home, Left, Up, Right, Down
+        | 0x2D | 0x2E // Insert, Delete
+        | 0x5B | 0x5C // Left Windows, Right Windows
+        | 0x6F // Numpad Divide
+        | 0xA3 // Right Ctrl
+        | 0xA5 // Right Alt
+    )
+}
 
 /// Injection backend.
 pub trait Backend {
@@ -57,13 +69,17 @@ impl SendInputBackend {
     }
 
     fn send(vk: u16, up: bool) {
+        let mut flags = if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) };
+        if is_extended_vk(vk) {
+            flags |= KEYEVENTF_EXTENDEDKEY;
+        }
         let mut input = INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
                     wVk: VIRTUAL_KEY(vk),
                     wScan: 0,
-                    dwFlags: if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) },
+                    dwFlags: flags,
                     time: 0,
                     dwExtraInfo: 0,
                 },

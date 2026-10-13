@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 //! osk-win: the on-screen keyboard for Windows.
 //!
 //! A topmost, non-activating Win32 window that draws the keyboard with GDI
@@ -50,6 +52,12 @@ enum Cmd {
 }
 
 fn main() {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+
     let cli = Cli::parse();
     let rc = if let Some(text) = cli.r#type {
         run_type(&text, &cli.backend)

@@ -344,6 +344,11 @@ impl Canvas {
     }
 
     fn select_font(&mut self, size: f32, bold: bool) {
+        if !self.font.is_null() && (self.font_size - size).abs() < 0.01 && self.font_bold == bold {
+            return;
+        }
+        self.font_size = size;
+        self.font_bold = bold;
         // Delete the old font, create a new one, select it.
         unsafe {
             if !self.font.is_null() {

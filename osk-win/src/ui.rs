@@ -14,26 +14,31 @@ use std::sync::LazyLock;
 use std::time::Instant;
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, GetDC, InvalidateRect, PAINTSTRUCT, ReleaseDC,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
-use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, KillTimer,
-    PostQuitMessage, RegisterClassExW, SetTimer, SetWindowPos, ShowWindow, TranslateMessage,
-    WNDCLASSEXW, CS_HREDRAW, CS_VREDRAW, MSG, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WM_DESTROY, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN, WM_SIZE, WM_TIMER,
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
+    KillTimer, PostQuitMessage, RegisterClassExW, SetTimer, SetWindowPos, ShowWindow,
+    TranslateMessage, CS_HREDRAW, CS_VREDRAW, MSG, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    SW_SHOWNOACTIVATE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE,
+    WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+};
+
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
 use crate::backend::{Backend, BackendSink};
 use crate::gdip::Canvas;
 use oskwin_core::events::{complete_word, tap_events, OskEvent, TAP_MAX_EVENTS};
 use oskwin_core::key::{key, Key, Layout};
 use oskwin_core::layout::ALL_LAYOUTS;
-use oskwin_core::mods::{mod_index, ModKeyState, ModifierEngine};
+use oskwin_core::mods::{mod_index, ModKeyState, ModifierEngine, MOD_META};
 use oskwin_core::predict::Predictor;
 use oskwin_core::typekey::{type_string, CharMap};
 
@@ -600,6 +605,8 @@ pub struct State {
     rsz_h: i32,
     grab_lx: i32,
     grab_ly: i32,
+    grab_sx: i32,
+    grab_sy: i32,
     // window position at the start of a bar drag (drag base)
     shown_x: i32,
     shown_y: i32,
@@ -705,6 +712,8 @@ impl State {
             rsz_h: 0,
             grab_lx: 0,
             grab_ly: 0,
+            grab_sx: 0,
+            grab_sy: 0,
             shown_x: initial_pos_x,
             shown_y: initial_pos_y,
             rep_key: -1,
@@ -878,8 +887,13 @@ impl State {
         if geom == self.last_geom {
             return;
         }
+        let size_changed = self.width != self.last_geom.2 || self.height != self.last_geom.3;
         self.last_geom = geom;
         if self.hwnd != 0 {
+            let mut flags = SWP_NOZORDER | SWP_NOACTIVATE;
+            if !size_changed {
+                flags |= SWP_NOSIZE;
+            }
             let _ = unsafe {
                 SetWindowPos(
                     HWND(self.hwnd as *mut _),
@@ -888,7 +902,7 @@ impl State {
                     self.pos_y,
                     self.width,
                     self.height,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
+                    flags,
                 )
             };
         }
@@ -1064,10 +1078,10 @@ impl State {
             self.rep_key = -1;
         }
         if self.moving {
-            // `shown_*` is the window position at grab time; the pointer's
-            // window-local offset from the grab point is the drag delta.
-            let nx = (self.shown_x + (self.px - self.grab_lx)).max(0);
-            let ny = (self.shown_y + (self.py - self.grab_ly)).max(0);
+            let mut pt = POINT::default();
+            let _ = unsafe { GetCursorPos(&mut pt) };
+            let nx = self.shown_x + (pt.x - self.grab_sx);
+            let ny = self.shown_y + (pt.y - self.grab_sy);
             if nx != self.pos_x || ny != self.pos_y {
                 self.pos_x = nx;
                 self.pos_y = ny;
@@ -1076,8 +1090,10 @@ impl State {
             return;
         }
         if self.resizing {
-            let w = (self.rsz_w + (self.px - self.grab_lx)).max(MIN_W);
-            let h = (self.rsz_h + (self.py - self.grab_ly)).max(MIN_H);
+            let mut pt = POINT::default();
+            let _ = unsafe { GetCursorPos(&mut pt) };
+            let w = (self.rsz_w + (pt.x - self.grab_sx)).max(MIN_W);
+            let h = (self.rsz_h + (pt.y - self.grab_sy)).max(MIN_H);
             if w != self.width || h != self.height {
                 self.width = w;
                 self.height = h;
@@ -1276,6 +1292,10 @@ impl State {
                 self.pressed = -1;
                 self.rep_key = -1;
                 self.resizing = true;
+                let mut pt = POINT::default();
+                let _ = unsafe { GetCursorPos(&mut pt) };
+                self.grab_sx = pt.x;
+                self.grab_sy = pt.y;
                 self.grab_lx = self.px;
                 self.grab_ly = self.py;
                 self.rsz_w = self.width;
@@ -1287,6 +1307,10 @@ impl State {
                 self.pressed = -1;
                 self.rep_key = -1;
                 self.moving = true;
+                let mut pt = POINT::default();
+                let _ = unsafe { GetCursorPos(&mut pt) };
+                self.grab_sx = pt.x;
+                self.grab_sy = pt.y;
                 self.grab_lx = self.px;
                 self.grab_ly = self.py;
                 self.shown_x = self.pos_x;
@@ -1297,7 +1321,18 @@ impl State {
                 return;
             };
             let key = *self.key_of(k);
-            // modifier key (shift/ctrl/alt/meta): run the 3-state machine
+            // Win is momentary: one press injects one press+release and the
+            // keycap shows the press, then returns to normal. No latch.
+            if mod_index(key.code) == Some(MOD_META) {
+                self.pressed = k as i32;
+                self.press_time = now_ms();
+                self.hold_fired = false;
+                self.backend.press(key.code);
+                self.backend.release(key.code);
+                self.request_redraw();
+                return;
+            }
+            // modifier key (shift/ctrl/alt): run the 3-state machine
             // (OFF -> LATCHED -> LOCKED -> OFF; double-click locks)
             if mod_index(key.code).is_some() {
                 self.mods.click(key.code, now_ms());
@@ -2301,6 +2336,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, _wparam: WPARAM, lparam
     let state = &mut *STATE_PTR;
     match msg {
         WM_MOUSEACTIVATE => LRESULT(3),
+        WM_ERASEBKGND => LRESULT(1),
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             BeginPaint(hwnd, &mut ps);
@@ -2321,10 +2357,31 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, _wparam: WPARAM, lparam
         WM_MOUSEMOVE => {
             let x = (lparam.0 & 0xffff) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+            let was_inside = state.inside;
             state.px = x;
             state.py = y;
             state.inside = x >= 0 && x < state.width && y >= 0 && y < state.height;
+            if !was_inside && state.inside {
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = unsafe { TrackMouseEvent(&mut tme) };
+            }
             state.on_motion();
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            state.inside = false;
+            if state.pressed >= 0 {
+                state.flash_key = state.pressed;
+                state.flash_until = now_ms() + FLASH_MS;
+                state.pressed = -1;
+            }
+            state.rep_key = -1;
+            state.request_redraw();
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
@@ -2335,6 +2392,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, _wparam: WPARAM, lparam
             state.py = y;
             state.inside = true;
             state.on_button(true);
+            if state.quit {
+                let _ = DestroyWindow(hwnd);
+            }
             LRESULT(0)
         }
         WM_LBUTTONUP => {
@@ -2515,6 +2575,100 @@ mod tests {
         unsafe {
             std::env::remove_var("OSK_CONFIG");
         }
+    }
+
+    struct MockBackend {
+        events: Vec<(u16, bool)>,
+    }
+
+    impl Backend for MockBackend {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+        fn init(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn press(&mut self, code: u16) {
+            self.events.push((code, true));
+        }
+        fn release(&mut self, code: u16) {
+            self.events.push((code, false));
+        }
+        fn pump(&mut self) {}
+        fn destroy(&mut self) {}
+    }
+
+    #[test]
+    fn test_win_key_momentary_tap() {
+        let backend = Box::new(MockBackend { events: Vec::new() });
+        let mut state = State::new(backend);
+        state.width = 800;
+        state.height = 300;
+
+        // Locate the Win / Super key in the 65% layout
+        let mut win_idx = None;
+        for (r, row) in state.layout().rows.iter().enumerate() {
+            for (k, key) in row.keys.iter().enumerate() {
+                if key.code == key::KEY_LEFTMETA {
+                    win_idx = Some(r * 100 + k);
+                    break;
+                }
+            }
+        }
+        let win_k = win_idx.expect("Win key should exist in 65% layout");
+
+        // Simulate click on the Win key
+        let (bx, by, bw, bh) = state.key_rect(win_k / 100, win_k % 100);
+        state.px = (bx + bw / 2.0) as i32;
+        state.py = (by + bh / 2.0) as i32;
+        state.on_button(true);
+
+        // Win key must inject press + release immediately (not latch)
+        assert_eq!(state.mods.state(MOD_META), ModKeyState::Off, "Win key should not latch modifier state");
+        assert_eq!(state.pressed, win_k as i32);
+
+        // Release button
+        state.on_button(false);
+        assert_eq!(state.flash_key, win_k as i32);
+        assert_eq!(state.pressed, -1);
+    }
+
+    #[test]
+    fn test_drag_and_resize_geometry() {
+        let backend = Box::new(MockBackend { events: Vec::new() });
+        let mut state = State::new(backend);
+        state.pos_x = 100;
+        state.pos_y = 100;
+        state.width = 600;
+        state.height = 300;
+
+        // Simulate moving: start drag at screen (150, 120)
+        state.moving = true;
+        state.shown_x = 100;
+        state.shown_y = 100;
+        state.grab_sx = 150;
+        state.grab_sy = 120;
+
+        // Moving cursor to screen (180, 140) produces delta (+30, +20)
+        let pt = POINT { x: 180, y: 140 };
+        let nx = state.shown_x + (pt.x - state.grab_sx);
+        let ny = state.shown_y + (pt.y - state.grab_sy);
+        assert_eq!(nx, 130);
+        assert_eq!(ny, 120);
+
+        // Simulate resizing: start resize at screen (750, 420)
+        state.resizing = true;
+        state.rsz_w = 600;
+        state.rsz_h = 300;
+        state.grab_sx = 750;
+        state.grab_sy = 420;
+
+        // Moving cursor to screen (800, 450) produces delta (+50, +30)
+        let pt2 = POINT { x: 800, y: 450 };
+        let w = (state.rsz_w + (pt2.x - state.grab_sx)).max(MIN_W);
+        let h = (state.rsz_h + (pt2.y - state.grab_sy)).max(MIN_H);
+        assert_eq!(w, 650);
+        assert_eq!(h, 330);
     }
 }
 
