@@ -225,13 +225,13 @@ fn run_click(x: i32, y: i32) -> i32 {
             },
         }
     };
-    let mut inputs = [
+    let inputs = [
         step(base),
         step(base | MOUSEEVENTF_LEFTDOWN.0),
         step(base | MOUSEEVENTF_LEFTUP.0),
     ];
     unsafe {
-        SendInput(&mut inputs, std::mem::size_of::<INPUT>() as i32);
+        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
     }
     println!("click at {x},{y}");
     0

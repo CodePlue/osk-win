@@ -9,7 +9,7 @@
 //! and [`ModifierEngine::sticky`].
 
 use crate::events::StickyMods;
-use crate::key::{key, Key};
+use crate::key::{key, Click, Key, KeyKind};
 
 /// State of one modifier.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -64,13 +64,65 @@ pub fn next_state(cur: ModKeyState, now: u64, last_click: u64) -> ModKeyState {
     }
 }
 
+/// The Shift and Caps Lock state that decides what case a key types.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Casing {
+    pub shift: bool,
+    pub caps: bool,
+}
+
+impl Casing {
+    /// Whether a letter types uppercase: Caps Lock inverts Shift.
+    #[inline]
+    pub const fn letter_upper(self) -> bool {
+        self.shift ^ self.caps
+    }
+
+    /// Whether a digit or symbol types its shifted form: Caps Lock
+    /// does not apply.
+    #[inline]
+    pub const fn symbol_shift(self) -> bool {
+        self.shift
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ModifierEngine {
     state: [ModKeyState; NMODS],
     /// Actual KEY_* (L vs R) of the key that armed each slot.
     code: [u16; NMODS],
     last_click_ms: [u64; NMODS],
+    /// Time of the last standalone tap on a momentary key per slot,
+    /// for double-click locking; None until the first tap.
+    tap_ms: [Option<u64>; NMODS],
+    /// A deferred standalone tap (code, due time) waiting out the
+    /// double-click window; see [`defers_tap`].
+    deferred: Option<(u16, u64)>,
     caps_lock: bool,
+}
+
+/// Whether a momentary slot waits out the double-click window before
+/// sending its standalone tap. Win does: a lone Super tap makes the
+/// compositor or shell act at once (e.g. open a search overlay over
+/// the keyboard), which would swallow the second click of a
+/// double-click. Alt taps at once, so its toggles stay instant.
+fn defers_tap(slot: usize) -> bool {
+    slot == MOD_META
+}
+
+/// What a click on a momentary modifier (Win, Alt) did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MomentaryClick {
+    /// Send one standalone press+release.
+    Tap,
+    /// A second click within [`DOUBLE_CLICK_MS`] locked the slot: it is
+    /// held around every tap until clicked again. No second tap is sent.
+    Locked,
+    /// The slot was locked; this click released it. Nothing is sent.
+    Unlocked,
+    /// The standalone tap is deferred until the double-click window
+    /// passes ([`ModifierEngine::take_due_tap`]); nothing is sent yet.
+    Deferred,
 }
 
 impl ModifierEngine {
@@ -88,6 +140,61 @@ impl ModifierEngine {
         self.state[slot] = next_state(self.state[slot], now, self.last_click_ms[slot]);
         self.last_click_ms[slot] = now;
         self.code[slot] = code;
+    }
+
+    /// Click a momentary modifier (Win, Alt) at `now` (ms). A single
+    /// click is a standalone tap; a second click within
+    /// [`DOUBLE_CLICK_MS`] locks the slot like a double-clicked Ctrl;
+    /// a click on a locked slot unlocks it. Non-modifier codes tap.
+    pub fn momentary_click(&mut self, code: u16, now: u64) -> MomentaryClick {
+        let Some(slot) = mod_index(code) else {
+            return MomentaryClick::Tap;
+        };
+        if self.state[slot] == ModKeyState::Locked {
+            self.state[slot] = ModKeyState::Off;
+            self.tap_ms[slot] = None;
+            return MomentaryClick::Unlocked;
+        }
+        if self.tap_ms[slot].is_some_and(|t| now.saturating_sub(t) < DOUBLE_CLICK_MS) {
+            self.state[slot] = ModKeyState::Locked;
+            self.code[slot] = code;
+            self.tap_ms[slot] = None;
+            // A deferred first tap is dropped: the double-click locks
+            // instead of tapping.
+            if self.deferred.is_some_and(|(c, _)| mod_index(c) == Some(slot)) {
+                self.deferred = None;
+            }
+            return MomentaryClick::Locked;
+        }
+        self.tap_ms[slot] = Some(now);
+        if defers_tap(slot) {
+            self.deferred = Some((code, now + DOUBLE_CLICK_MS));
+            return MomentaryClick::Deferred;
+        }
+        MomentaryClick::Tap
+    }
+
+    /// The deferred standalone tap's code once it is due at `now` (or
+    /// at once with `force`, before another key so the order holds),
+    /// clearing it; None when nothing is pending or it is not due.
+    pub fn take_due_tap(&mut self, now: u64, force: bool) -> Option<u16> {
+        let (code, due) = self.deferred?;
+        if force || now >= due {
+            self.deferred = None;
+            Some(code)
+        } else {
+            None
+        }
+    }
+
+    /// The modifier slot of the pending deferred tap, if any.
+    pub fn deferred_slot(&self) -> Option<usize> {
+        self.deferred.and_then(|(code, _)| mod_index(code))
+    }
+
+    /// When the deferred standalone tap is due, if one is pending.
+    pub fn deferred_due(&self) -> Option<u64> {
+        self.deferred.map(|(_, due)| due)
     }
 
     pub fn toggle_caps(&mut self) {
@@ -125,6 +232,15 @@ impl ModifierEngine {
         self.state[MOD_SHIFT].is_active()
     }
 
+    /// The current [`Casing`] for tap events and word completion.
+    #[inline]
+    pub fn casing(&self) -> Casing {
+        Casing {
+            shift: self.shift_active(),
+            caps: self.caps_lock,
+        }
+    }
+
     /// Sticky ctrl/alt/meta for tap-event generation, taken from the
     /// engine slots.
     pub fn sticky(&self) -> StickyMods {
@@ -141,22 +257,33 @@ impl ModifierEngine {
         }
     }
 
-    /// Visual state of a key for rendering: modifier keys return their
-    /// slot state (only the physical key that was latched/locked lights
-    /// up), caps returns LOCKED when caps_lock is on, everything else
-    /// returns OFF.
+    /// Visual state of a key for rendering: latching modifier keys return
+    /// their slot state (only the physical key that was latched/locked
+    /// lights up), caps returns LOCKED when caps_lock is on, everything
+    /// else (tap keys, momentary keys, gaps) returns OFF.
     pub fn key_visual(&self, k: &Key) -> ModKeyState {
-        if k.toggle && k.code == key::KEY_CAPSLOCK {
-            return if self.caps_lock {
-                ModKeyState::Locked
-            } else {
-                ModKeyState::Off
-            };
-        }
-        if let Some(idx) = mod_index(k.code) {
-            if self.state[idx].is_active() && self.code[idx] == k.code {
-                return self.state[idx];
+        match k.kind {
+            KeyKind::Inject {
+                code,
+                click: Click::Caps,
+            } if code.get() == key::KEY_CAPSLOCK => {
+                return if self.caps_lock {
+                    ModKeyState::Locked
+                } else {
+                    ModKeyState::Off
+                };
             }
+            KeyKind::Inject {
+                code,
+                click: Click::Latch | Click::Momentary,
+            } => {
+                if let Some(idx) = mod_index(code.get()) {
+                    if self.state[idx].is_active() && self.code[idx] == code.get() {
+                        return self.state[idx];
+                    }
+                }
+            }
+            _ => {}
         }
         ModKeyState::Off
     }

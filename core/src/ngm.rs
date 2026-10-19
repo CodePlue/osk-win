@@ -121,6 +121,12 @@ impl Model {
         self.id.get(w).copied()
     }
 
+    /// Number of words in the vocabulary.
+    #[allow(clippy::len_without_is_empty)] // the embedded vocab is never empty
+    pub fn len(&self) -> usize {
+        self.words.len()
+    }
+
     /// The word for an id.
     pub fn word(&self, id: u16) -> Option<&'static str> {
         self.words.get(id as usize).copied()

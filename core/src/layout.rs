@@ -3,8 +3,9 @@
 //! Key codes are linux input event codes (KEY_*), exactly what both
 //! injection backends consume.
 //!
-//! Widths are in 1/20 key units (20 = 1.0u). A code-0 key is inert:
-//! drawn, never injected. `Key::inert(None, _)` is a spacing gap.
+//! Widths are in 1/20 key units (20 = 1.0u). A gap key is inert:
+//! drawn when labeled, never injected. `Key::inert(None, _)` is a
+//! spacing gap.
 
 use crate::key::{key, Key, Layout, Row};
 
@@ -47,7 +48,7 @@ const P65_ROW1: [Key; 15] = [
 ];
 
 const P65_ROW2: [Key; 14] = [
-     Key::toggle_key("caps", key::KEY_CAPSLOCK, 35),
+     Key::caps("caps", key::KEY_CAPSLOCK, 35),
     Key::letter("A", key::KEY_A),
     Key::letter("S", key::KEY_S),
     Key::letter("D", key::KEY_D),
@@ -64,7 +65,7 @@ const P65_ROW2: [Key; 14] = [
 ];
 
 const P65_ROW3: [Key; 14] = [
-     Key::toggle_key("\u{21E7}", key::KEY_LEFTSHIFT, 45), // ⇧
+     Key::latch("\u{21E7}", key::KEY_LEFTSHIFT, 45), // ⇧
     Key::letter("Z", key::KEY_Z),
     Key::letter("X", key::KEY_X),
     Key::letter("C", key::KEY_C),
@@ -75,18 +76,18 @@ const P65_ROW3: [Key; 14] = [
     Key::sym(",", key::KEY_COMMA, "<"),
     Key::sym(".", key::KEY_DOT, ">"),
     Key::sym("/", key::KEY_SLASH, "?"),
-     Key::toggle_key("\u{21E7}", key::KEY_RIGHTSHIFT, 35), // ⇧
+     Key::latch("\u{21E7}", key::KEY_RIGHTSHIFT, 35), // ⇧
     Key::wide_repeat("\u{2191}", key::KEY_UP, 20),             // ↑
     Key::wide("end", key::KEY_END, 20),
 ];
 
 const P65_ROW4: [Key; 10] = [
-     Key::momentary("ctrl", key::KEY_LEFTCTRL, 25),
+     Key::latch("ctrl", key::KEY_LEFTCTRL, 25),
      Key::momentary("win", key::KEY_LEFTMETA, 25),
      Key::momentary("alt", key::KEY_LEFTALT, 25),
     Key::space(125),
      Key::momentary("alt", key::KEY_RIGHTALT, 25),
-     Key::momentary("ctrl", key::KEY_RIGHTCTRL, 25),
+     Key::latch("ctrl", key::KEY_RIGHTCTRL, 25),
     // 0.5u gap before the arrow cluster
     Key::inert(None, 10),
     Key::wide_repeat("\u{2190}", key::KEY_LEFT, 20), // ←
@@ -157,7 +158,7 @@ const NUMPAD_ROW1: [Key; 20] = [
 ];
 
 const NUMPAD_ROW2: [Key; 19] = [
-    Key::toggle_key("caps", key::KEY_CAPSLOCK, 35),
+    Key::caps("caps", key::KEY_CAPSLOCK, 35),
     Key::letter("A", key::KEY_A),
     Key::letter("S", key::KEY_S),
     Key::letter("D", key::KEY_D),
@@ -180,7 +181,7 @@ const NUMPAD_ROW2: [Key; 19] = [
 ];
 
 const NUMPAD_ROW3: [Key; 19] = [
-    Key::toggle_key("\u{21E7}", key::KEY_LEFTSHIFT, 45),
+    Key::latch("\u{21E7}", key::KEY_LEFTSHIFT, 45),
     Key::letter("Z", key::KEY_Z),
     Key::letter("X", key::KEY_X),
     Key::letter("C", key::KEY_C),
@@ -191,7 +192,7 @@ const NUMPAD_ROW3: [Key; 19] = [
     Key::sym(",", key::KEY_COMMA, "<"),
     Key::sym(".", key::KEY_DOT, ">"),
     Key::sym("/", key::KEY_SLASH, "?"),
-    Key::toggle_key("\u{21E7}", key::KEY_RIGHTSHIFT, 35),
+    Key::latch("\u{21E7}", key::KEY_RIGHTSHIFT, 35),
     Key::wide_repeat("\u{2191}", key::KEY_UP, 20),
     Key::wide("end", key::KEY_END, 20),
     // 0.5u gap before the numpad
@@ -203,12 +204,12 @@ const NUMPAD_ROW3: [Key; 19] = [
 ];
 
 const NUMPAD_ROW4: [Key; 14] = [
-    Key::momentary("ctrl", key::KEY_LEFTCTRL, 25),
+    Key::latch("ctrl", key::KEY_LEFTCTRL, 25),
     Key::momentary("win", key::KEY_LEFTMETA, 25),
     Key::momentary("alt", key::KEY_LEFTALT, 25),
     Key::space(125),
     Key::momentary("alt", key::KEY_RIGHTALT, 25),
-    Key::momentary("ctrl", key::KEY_RIGHTCTRL, 25),
+    Key::latch("ctrl", key::KEY_RIGHTCTRL, 25),
     // 0.5u gap before the arrow cluster
     Key::inert(None, 10),
     Key::wide_repeat("\u{2190}", key::KEY_LEFT, 20),

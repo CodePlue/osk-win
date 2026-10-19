@@ -1,22 +1,22 @@
-//! The Win32/GDI on-screen keyboard.
+//! The Win32 host: a topmost, non-activating popup window running the
+//! Linux osk's UI.
 //!
-//! The keyboard is a topmost, non-activating popup window. `MA_NOACTIVATE`
-//! in the window procedure keeps it from stealing focus, so injected keys
-//! land in whatever window the user focused. Pointer events are delivered
-//! normally because the window is not `WS_EX_TRANSPARENT`.
+//! Everything a click does is the shared [`Controller`]; the pointer
+//! state is the shared [`Interaction`]; a frame paints the shared
+//! [`View`] from `render.rs`. This file is the Win32 side of the Linux
+//! `ui.rs`: the window, its messages, and a timer armed only for the
+//! next deadline (key repeat, hold, flash, the handle ease, dictation),
+//! so an idle keyboard runs nothing.
 //!
-//! Rendering: the keyboard is drawn into a 32-bit back buffer (the
-//! [`Canvas`]) and blitted to the window DC on `WM_PAINT`. There is no
-//! compositor to negotiate with, so a resize is a plain `SetWindowPos`.
+//! `WM_MOUSEACTIVATE` returns `MA_NOACTIVATE`, so the keyboard never
+//! takes focus and injected keys land in the window the user focused.
 
 use std::path::PathBuf;
-use std::sync::LazyLock;
-use std::time::Instant;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, GetDC, InvalidateRect, PAINTSTRUCT, ReleaseDC,
+    BeginPaint, EndPaint, InvalidateRect, UpdateWindow, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -24,449 +24,45 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
-    KillTimer, PostQuitMessage, RegisterClassExW, SetTimer, SetWindowPos, ShowWindow,
-    TranslateMessage, CS_HREDRAW, CS_VREDRAW, IDC_ARROW, LoadCursorW, MSG, SetCursor,
+    KillTimer, LoadCursorW, PostQuitMessage, RegisterClassExW, SetCursor, SetTimer, SetWindowPos,
+    ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, IDC_ARROW, IDC_SIZENWSE, MSG,
     SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE, WM_DESTROY, WM_ERASEBKGND,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN,
     WM_SETCURSOR, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP,
 };
 
-const WM_MOUSELEAVE: u32 = 0x02A3;
+use osk_core::controller::{Clicked, Controller, ControllerConfig};
+use osk_core::interaction::{self, Event as IEvent, Interaction};
+use osk_core::key::{Key, Layout};
+use osk_core::layout::ALL_LAYOUTS;
+use osk_core::metrics::Metrics;
+use osk_core::neural::NeuralEngine;
+use osk_core::predict::Predictor;
+#[cfg(feature = "dictation")]
+use osk_core::typekey::type_text;
 
 use crate::backend::{Backend, BackendSink};
-use crate::gdip::Canvas;
-use oskwin_core::events::{complete_word, tap_events, OskEvent, TAP_MAX_EVENTS};
-use oskwin_core::key::{key, Key, Layout};
-use oskwin_core::layout::ALL_LAYOUTS;
-use oskwin_core::mods::{mod_index, ModKeyState, ModifierEngine, MOD_ALT, MOD_META};
-use oskwin_core::predict::Predictor;
-use oskwin_core::typekey::{type_string, CharMap};
+use crate::cairo::{Context, FontSlant, FontWeight, Format, ImageSurface};
+use crate::history::{load_history, save_history_if_dirty};
+#[cfg(feature = "dictation")]
+use crate::render::DictState;
+use crate::render::{
+    self, now_ms, BarLayout, KeyCache, Rect, Theme, THEMES, View, FONT, ViaChipLook, ViaFrame,
+};
 
-// ---- geometry, in key units (1u = one normal key) ----
-// Thinner keyboard profile: 0.12u margin, 0.65u top bar, 42px unit.
-const MARGIN_U: f64 = 0.12;
-const BAR_U: f64 = 0.65;
-const INSET_X_U: f64 = 0.040;
-const INSET_Y_U: f64 = 0.040;
-const KEY_RAD_U: f64 = 0.16;
-const CASE_RAD_U: f64 = 0.5;
-const FONT_U: f64 = 0.36;
-/// Default pixel size of 1u.
-const U0: f64 = 46.0;
 /// Smallest surface the resize handle allows.
 const MIN_W: i32 = 200;
 const MIN_H: i32 = 180;
-const FLASH_MS: u64 = 150;
-
-// Sans-serif face for the labels; it carries every glyph we draw
-// (letters, digits, and the arrow/symbol caps) in one font.
-const FONT: &str = "Adwaita Sans";
-
-/// Dictation lifecycle.
+const FLASH_MS: u64 = 60;
+/// Frame pacing of the handle ease and the dictation waveform.
+const ANIM_FRAME_MS: u64 = 16;
 #[cfg(feature = "dictation")]
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DictState {
-    Idle,
-    Recording,
-    Transcribing,
-}
+const DICT_FRAME_MS: u64 = 33;
 
-#[derive(Clone, Copy, Debug)]
-pub struct Theme {
-    pub name: &'static str,
-    pub case: u32,
-    pub key: u32,
-    pub key_hov: u32,
-    #[allow(dead_code)]
-    pub key_hi: u32,
-    #[allow(dead_code)]
-    pub key_shdw: u32,
-    pub key_mod: u32,
-    pub keytxt: u32,
-    pub modtxt: u32,
-    pub accent: u32,
-    pub ink: u32,
-    pub on_bg: u32,
-    pub on_txt: u32,
-    pub key_press: u32,
-    pub key_hold: u32,
-    #[allow(dead_code)]
-    pub hair: u32,
-    pub edge: u32,
-    #[allow(dead_code)]
-    pub sugtxt: u32,
-    #[allow(dead_code)]
-    pub sugtxt_first: u32,
-    #[allow(dead_code)]
-    pub part: u32,
-    pub close: u32,
-    pub opacity: f64,
-}
-
-pub static THEMES: &[Theme] = &[
-    Theme {
-        name: "Default",
-        case: 0x0f1420,
-        key: 0x1b2132,
-        key_hov: 0x313748,
-        key_hi: 0x292e3e,
-        key_shdw: 0x090d15,
-        key_mod: 0x181e2e,
-        keytxt: 0xd5dcec,
-        modtxt: 0x7d88a3,
-        accent: 0x5ad6c6,
-        ink: 0x04201c,
-        on_bg: 0x1e3a45,
-        on_txt: 0x7de8da,
-        key_press: 0x5ad6c6,
-        key_hold: 0x38b2a3,
-        hair: 0x222732,
-        edge: 0x283145,
-        sugtxt: 0x8a96b0,
-        sugtxt_first: 0x7de8da,
-        part: 0xe4e9f5,
-        close: 0x7d88a3,
-        opacity: 1.0,
-    },
-    Theme {
-        name: "Tokyo",
-        case: 0x1a1b26,
-        key: 0x24283b,
-        key_hov: 0x343b58,
-        key_hi: 0x394b70,
-        key_shdw: 0x13141c,
-        key_mod: 0x212538,
-        keytxt: 0xc0caf5,
-        modtxt: 0x7aa2f7,
-        accent: 0xbb9af7,
-        ink: 0x1a1b26,
-        on_bg: 0x3b335a,
-        on_txt: 0xc0caf5,
-        key_press: 0xbb9af7,
-        key_hold: 0x9d7cd8,
-        hair: 0x292e42,
-        edge: 0x323852,
-        sugtxt: 0x7aa2f7,
-        sugtxt_first: 0xbb9af7,
-        part: 0xff9e64,
-        close: 0xf7768e,
-        opacity: 1.0,
-    },
-    Theme {
-        name: "Catppuccin",
-        case: 0x11111b,
-        key: 0x1e1e2e,
-        key_hov: 0x313244,
-        key_hi: 0x45475a,
-        key_shdw: 0x09090d,
-        key_mod: 0x1b1b2a,
-        keytxt: 0xcdd6f4,
-        modtxt: 0xa6adc8,
-        accent: 0xcba6f7,
-        ink: 0x11111b,
-        on_bg: 0x45355c,
-        on_txt: 0xcba6f7,
-        key_press: 0xcba6f7,
-        key_hold: 0xb4befe,
-        hair: 0x313244,
-        edge: 0x313244,
-        sugtxt: 0x89b4fa,
-        sugtxt_first: 0xcba6f7,
-        part: 0xa6e3a1,
-        close: 0xf38ba8,
-        opacity: 1.0,
-    },
-    Theme {
-        name: "Nord",
-        case: 0x242933,
-        key: 0x2e3440,
-        key_hov: 0x434c5e,
-        key_hi: 0x4c566a,
-        key_shdw: 0x1b1f27,
-        key_mod: 0x2b313d,
-        keytxt: 0xeceff4,
-        modtxt: 0xd8dee9,
-        accent: 0x88c0d0,
-        ink: 0x2e3440,
-        on_bg: 0x3b4a58,
-        on_txt: 0x88c0d0,
-        key_press: 0x88c0d0,
-        key_hold: 0x81a1c1,
-        hair: 0x3b4252,
-        edge: 0x3f4859,
-        sugtxt: 0x81a1c1,
-        sugtxt_first: 0x88c0d0,
-        part: 0xa3be8c,
-        close: 0xbf616a,
-        opacity: 1.0,
-    },
-    Theme {
-        name: "Gruvbox",
-        case: 0x1d2021,
-        key: 0x282828,
-        key_hov: 0x3c3836,
-        key_hi: 0x504945,
-        key_shdw: 0x141617,
-        key_mod: 0x252525,
-        keytxt: 0xebdbb2,
-        modtxt: 0xd5c4a1,
-        accent: 0xfe8019,
-        ink: 0x1d2021,
-        on_bg: 0x503b28,
-        on_txt: 0xfe8019,
-        key_press: 0xfe8019,
-        key_hold: 0xd65d0e,
-        hair: 0x3c3836,
-        edge: 0x3c3836,
-        sugtxt: 0x83a598,
-        sugtxt_first: 0xfe8019,
-        part: 0xd3869b,
-        close: 0xfb4934,
-        opacity: 1.0,
-    },
-    Theme {
-        name: "Rose Pine",
-        case: 0x191724,
-        key: 0x1f1d2e,
-        key_hov: 0x26233a,
-        key_hi: 0x312f44,
-        key_shdw: 0x13111c,
-        key_mod: 0x222033,
-        keytxt: 0xe0def4,
-        modtxt: 0x908caa,
-        accent: 0xebbcba,
-        ink: 0x191724,
-        on_bg: 0x3b2f3d,
-        on_txt: 0xebbcba,
-        key_press: 0xebbcba,
-        key_hold: 0xd49b99,
-        hair: 0x26233a,
-        edge: 0x332f48,
-        sugtxt: 0x908caa,
-        sugtxt_first: 0xebbcba,
-        part: 0xeb6f92,
-        close: 0xeb6f92,
-        opacity: 1.0,
-    },
-    Theme {
-        name: "Dracula",
-        case: 0x21222c,
-        key: 0x282a36,
-        key_hov: 0x44475a,
-        key_hi: 0x6272a4,
-        key_shdw: 0x191a21,
-        key_mod: 0x292b3a,
-        keytxt: 0xf8f8f2,
-        modtxt: 0x6272a4,
-        accent: 0xbd93f9,
-        ink: 0x282a36,
-        on_bg: 0x493d63,
-        on_txt: 0xbd93f9,
-        key_press: 0xbd93f9,
-        key_hold: 0x9a6bd8,
-        hair: 0x44475a,
-        edge: 0x3b3e52,
-        sugtxt: 0x8be9fd,
-        sugtxt_first: 0xbd93f9,
-        part: 0xffb86c,
-        close: 0xff5555,
-        opacity: 1.0,
-    },
-    Theme {
-        name: "Everforest",
-        case: 0x232a2e,
-        key: 0x2d353b,
-        key_hov: 0x3d484d,
-        key_hi: 0x475258,
-        key_shdw: 0x1e2326,
-        key_mod: 0x2a3137,
-        keytxt: 0xd3c6aa,
-        modtxt: 0x859289,
-        accent: 0xa7c080,
-        ink: 0x232a2e,
-        on_bg: 0x374239,
-        on_txt: 0xa7c080,
-        key_press: 0xa7c080,
-        key_hold: 0x8fa86b,
-        hair: 0x343f44,
-        edge: 0x3b464c,
-        sugtxt: 0x83c092,
-        sugtxt_first: 0xa7c080,
-        part: 0xe69875,
-        close: 0xe67e80,
-        opacity: 1.0,
-    },
-    Theme {
-        name: "Kanagawa",
-        case: 0x181820,
-        key: 0x1f1f28,
-        key_hov: 0x2a2a37,
-        key_hi: 0x363646,
-        key_shdw: 0x16161d,
-        key_mod: 0x22222d,
-        keytxt: 0xdcd7ba,
-        modtxt: 0x727169,
-        accent: 0x957fb8,
-        ink: 0x181820,
-        on_bg: 0x363447,
-        on_txt: 0x957fb8,
-        key_press: 0x957fb8,
-        key_hold: 0x7e699b,
-        hair: 0x2a2a37,
-        edge: 0x31313f,
-        sugtxt: 0x7aa89f,
-        sugtxt_first: 0x957fb8,
-        part: 0xffa066,
-        close: 0xc34043,
-        opacity: 1.0,
-    },
-    Theme {
-        name: "Solarized",
-        case: 0x00212b,
-        key: 0x073642,
-        key_hov: 0x0d4857,
-        key_hi: 0x586e75,
-        key_shdw: 0x001b22,
-        key_mod: 0x002b36,
-        keytxt: 0x93a1a1,
-        modtxt: 0x657b83,
-        accent: 0x268bd2,
-        ink: 0x002b36,
-        on_bg: 0x074354,
-        on_txt: 0x268bd2,
-        key_press: 0x268bd2,
-        key_hold: 0x1d70a8,
-        hair: 0x073642,
-        edge: 0x001b22,
-        sugtxt: 0x2aa198,
-        sugtxt_first: 0x268bd2,
-        part: 0xcb4b16,
-        close: 0xdc322f,
-        opacity: 1.0,
-    },
-    Theme {
-        name: "Cyberpunk",
-        case: 0x120e24,
-        key: 0x1a1638,
-        key_hov: 0x282156,
-        key_hi: 0x3d2b78,
-        key_shdw: 0x0d091b,
-        key_mod: 0x15102c,
-        keytxt: 0x00ffc2,
-        modtxt: 0x965fd4,
-        accent: 0xff0055,
-        ink: 0x120e24,
-        on_bg: 0x47152b,
-        on_txt: 0xff0055,
-        key_press: 0xff0055,
-        key_hold: 0xcc0044,
-        hair: 0x261e47,
-        edge: 0x0d091b,
-        sugtxt: 0x965fd4,
-        sugtxt_first: 0xff0055,
-        part: 0xff5500,
-        close: 0xff0055,
-        opacity: 1.0,
-    },
-    Theme {
-        name: "Light",
-        case: 0xe4e7eb,
-        key: 0xffffff,
-        key_hov: 0xd9e2ec,
-        key_hi: 0xf8fafc,
-        key_shdw: 0xc1c9d2,
-        key_mod: 0xdce1e8,
-        keytxt: 0x102a43,
-        modtxt: 0x486581,
-        accent: 0x0b69a3,
-        ink: 0xffffff,
-        on_bg: 0xd0e2f2,
-        on_txt: 0x0b69a3,
-        key_press: 0x0b69a3,
-        key_hold: 0x084e7a,
-        hair: 0xcbd2d9,
-        edge: 0xbcccdc,
-        sugtxt: 0x486581,
-        sugtxt_first: 0x0b69a3,
-        part: 0x0b69a3,
-        close: 0xd9534f,
-        opacity: 1.0,
-    },
-];
-
-static START: LazyLock<Instant> = LazyLock::new(Instant::now);
-
-fn now_ms() -> u64 {
-    START.elapsed().as_millis() as u64
-}
-
-fn set_src_rgba(cr: &mut Canvas, argb: u32, alpha: f64) {
-    cr.set_source_rgba(
-        ((argb >> 16) & 0xff) as f64 / 255.0,
-        ((argb >> 8) & 0xff) as f64 / 255.0,
-        (argb & 0xff) as f64 / 255.0,
-        alpha,
-    );
-}
-
-fn set_src(cr: &mut Canvas, argb: u32) {
-    set_src_rgba(cr, argb, 1.0);
-}
-
-/// Rounded rectangle. The radius is clamped to half the smaller side so the
-/// arcs never overlap.
-fn rrect(cr: &mut Canvas, x: f64, y: f64, w: f64, h: f64, rad: f64) {
-    let mut r = rad;
-    if r > w / 2.0 {
-        r = w / 2.0;
-    }
-    if r > h / 2.0 {
-        r = h / 2.0;
-    }
-    cr.rrect(x, y, w, h, r);
-}
-
-/// A measured rectangle in logical coordinates.
-#[derive(Clone, Copy, Default, Debug)]
-struct Rect {
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-    /// Index into the suggestion list (0 for close/layout).
-    idx: usize,
-}
-
-impl Rect {
-    fn contains(&self, x: f64, y: f64) -> bool {
-        x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
-    }
-}
-
-/// Bar element positions measured during render.
-#[derive(Clone, Copy)]
-struct BarLayout {
-    sugg: [Rect; 5],
-    n_sugg: usize,
-    layout_rect: Rect,
-    theme_rect: Rect,
-    close_rect: Rect,
-    theme_menu_rect: Rect,
-    theme_item_rects: [Rect; 12],
-    dict_rect: Rect,
-    dict_menu_rect: Rect,
-    dict_tab_toggle_rect: Rect,
-    dict_clear_rect: Rect,
-    dict_prev_rect: Rect,
-    dict_next_rect: Rect,
-    dict_remove_rects: [Rect; 8],
-    dict_words: [Option<&'static str>; 8],
-    n_dict_items: usize,
-    mic_rect: Rect,
-    pred_toggle_rect: Rect,
-    tab_toggle_rect: Rect,
-}
+const WM_MOUSELEAVE: u32 = 0x02A3;
+const MA_NOACTIVATE: isize = 3;
+const TIMER_ID: usize = 1;
 
 /// Saved preferences and window geometry persisted between runs.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -516,6 +112,8 @@ impl Default for PersistentConfig {
     }
 }
 
+/// `%OSK_CONFIG%`, else `%APPDATA%\osk\config.json` (or the local or
+/// profile AppData).
 fn config_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("OSK_CONFIG") {
         let trimmed = path.trim();
@@ -523,43 +121,19 @@ fn config_path() -> Option<PathBuf> {
             return Some(PathBuf::from(trimmed));
         }
     }
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        let trimmed = appdata.trim();
-        if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed).join("osk").join("config.json"));
+    for var in ["APPDATA", "LOCALAPPDATA"] {
+        if let Ok(dir) = std::env::var(var) {
+            let trimmed = dir.trim();
+            if !trimmed.is_empty() {
+                return Some(PathBuf::from(trimmed).join("osk").join("config.json"));
+            }
         }
     }
-    if let Ok(localappdata) = std::env::var("LOCALAPPDATA") {
-        let trimmed = localappdata.trim();
-        if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed).join("osk").join("config.json"));
-        }
-    }
-    if let Ok(userprofile) = std::env::var("USERPROFILE") {
-        let trimmed = userprofile.trim();
-        if !trimmed.is_empty() {
-            return Some(
-                PathBuf::from(trimmed)
-                    .join("AppData")
-                    .join("Roaming")
-                    .join("osk")
-                    .join("config.json"),
-            );
-        }
-    }
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        let trimmed = xdg.trim();
-        if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed).join("osk").join("config.json"));
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let trimmed = home.trim();
-        if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed).join(".config").join("osk").join("config.json"));
-        }
-    }
-    None
+    let profile = std::env::var("USERPROFILE").ok()?;
+    let trimmed = profile.trim();
+    (!trimmed.is_empty()).then(|| {
+        PathBuf::from(trimmed).join("AppData").join("Roaming").join("osk").join("config.json")
+    })
 }
 
 impl PersistentConfig {
@@ -583,6 +157,8 @@ impl PersistentConfig {
         let Ok(json) = serde_json::to_string_pretty(self) else {
             return;
         };
+        // Windows refuses to rename over an existing file, so the old
+        // one goes first; the plain write is the last resort.
         let tmp = path.with_extension("tmp");
         if std::fs::write(&tmp, json.as_bytes()).is_ok() {
             if std::fs::rename(&tmp, &path).is_err() {
@@ -597,52 +173,39 @@ impl PersistentConfig {
     }
 }
 
+// The UI has a handful of independent flags; the real interaction
+// state lives in `interaction`, so no reset can miss it.
+#[allow(clippy::struct_excessive_bools)]
 pub struct State {
     backend: Box<dyn Backend>,
-    /// Window handle, set once the window is created (0 before that).
-    pub hwnd: isize,
-    /// Cached back buffer, recreated when the window is resized.
-    canvas: Option<Canvas>,
-    // geometry (logical)
+    /// Window handle, 0 until the window exists.
+    hwnd: isize,
+    /// The back buffer a frame is drawn into, then copied to the window.
+    surface: Option<ImageSurface>,
+    /// The at-rest keyboard, reused until what it depends on changes.
+    key_cache: Option<KeyCache>,
     width: i32,
     height: i32,
     pos_x: i32,
     pos_y: i32,
-    // pointer
+    // pointer, client coordinates
     px: i32,
     py: i32,
     inside: bool,
-    // interaction
-    pressed: i32,
-    press_time: u64,
-    hold_fired: bool,
-    // flash: key keeps its pressed look briefly after release
+    interaction: Interaction,
+    /// Window position when a drag began. Windows moves the window
+    /// under the pointer, so a drag follows the pointer in screen
+    /// coordinates from here (client coordinates jitter).
+    drag_origin: (i32, i32),
     flash_key: i32,
     flash_until: u64,
-    moving: bool,
-    resizing: bool,
-    rsz_w: i32,
-    rsz_h: i32,
-    grab_lx: i32,
-    grab_ly: i32,
-    grab_sx: i32,
-    grab_sy: i32,
-    // window position at the start of a bar drag (drag base)
-    shown_x: i32,
-    shown_y: i32,
-    // key repeat
-    rep_key: i32,
-    rep_next: u64,
     grid_cols: i32,
-    // engines
-    mods: ModifierEngine,
-    predictor: Predictor,
-    charmap: Option<CharMap>,
-    // rendering
-    dirty: bool,
+    handle_hover: bool,
+    handle_anim_since: Option<u64>,
+    ctl: Controller,
     last_hot: u32,
     last_geom: (i32, i32, i32, i32),
-    // measured bar layout (filled during render)
+    // measured bar layout, filled during render
     sugg: [Rect; 5],
     n_sugg: usize,
     layout_rect: Rect,
@@ -654,106 +217,66 @@ pub struct State {
     theme_menu_open: bool,
     theme_menu_rect: Rect,
     theme_item_rects: [Rect; 12],
-    tab_accepts_prediction: bool,
     tab_toggle_rect: Rect,
-    prediction: bool,
     pred_toggle_rect: Rect,
-    dict_menu_open: bool,
-    dict_page: usize,
-    dict_rect: Rect,
-    dict_menu_rect: Rect,
-    dict_tab_toggle_rect: Rect,
-    dict_clear_rect: Rect,
-    dict_prev_rect: Rect,
-    dict_next_rect: Rect,
-    dict_remove_rects: [Rect; 8],
-    dict_words: [Option<&'static str>; 8],
-    n_dict_items: usize,
-    // dictation
+    mic_rect: Rect,
     #[cfg(feature = "dictation")]
     dict_state: DictState,
     #[cfg(feature = "dictation")]
     recorder: Option<crate::dictate::Recorder>,
     #[cfg(feature = "dictation")]
     dict_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
-    mic_rect: Rect,
-    // control
+    #[cfg(feature = "dictation")]
+    dict_frame_due: u64,
     quit: bool,
 }
 
 impl State {
-    pub fn new(backend: Box<dyn Backend>) -> Self {
-        crate::gdip::ensure_embedded_font();
+    pub fn new(backend: Box<dyn Backend>, neural: Option<NeuralEngine>) -> Self {
         let config = PersistentConfig::load();
-        let initial_theme_idx = std::env::var("OSK_THEME")
+        let theme_idx = std::env::var("OSK_THEME")
             .ok()
             .and_then(|name| THEMES.iter().position(|t| t.name.eq_ignore_ascii_case(&name)))
-            .or_else(|| {
-                if !config.theme.is_empty() {
-                    THEMES.iter().position(|t| t.name.eq_ignore_ascii_case(&config.theme))
-                } else {
-                    None
-                }
-            })
+            .or_else(|| THEMES.iter().position(|t| t.name.eq_ignore_ascii_case(&config.theme)))
             .unwrap_or(0);
-        let theme = THEMES[initial_theme_idx];
-
-        let initial_layout_idx = if !config.layout.is_empty() {
-            ALL_LAYOUTS
-                .iter()
-                .position(|l| l.name.eq_ignore_ascii_case(&config.layout))
-                .unwrap_or(0)
-        } else {
-            0
-        };
-
-        let initial_pos_x = if config.pos_x >= 0 { config.pos_x } else { 600 };
-        let initial_pos_y = if config.pos_y >= 0 { config.pos_y } else { 450 };
-        let initial_layout = ALL_LAYOUTS[initial_layout_idx];
-        let rows = initial_layout.rows.len() as f64;
-        let mut cols = 0;
-        for row in initial_layout.rows {
-            let row_units: u16 = row.keys.iter().map(|k| k.width).sum();
-            cols = cols.max(row_units);
-        }
-        let default_w = ((cols as f64 / 20.0 + 2.0 * MARGIN_U) * U0 + 0.5) as i32;
-        let default_h = ((BAR_U + rows + 2.0 * MARGIN_U) * U0 + 0.5) as i32;
-        let initial_w = if config.width >= MIN_W { config.width } else { default_w };
-        let initial_h = if config.height >= MIN_H { config.height } else { default_h };
-
-        let mut state = State {
+        let layout_idx = ALL_LAYOUTS
+            .iter()
+            .position(|l| l.name.eq_ignore_ascii_case(&config.layout))
+            .unwrap_or(0);
+        let layout = render::layout_at(layout_idx);
+        let grid_cols = render::grid_cols(layout);
+        let (default_w, default_h) = render::default_size(layout, grid_cols);
+        let mut ctl = Controller::with_neural(
+            ControllerConfig {
+                prediction: config.prediction,
+                tab_accepts_prediction: config.tab_accepts_prediction,
+            },
+            Predictor::new(),
+            neural,
+        );
+        // The predictor starts empty; the host loads the learned history
+        // once and saves it whenever a commit flags it dirty.
+        load_history(ctl.predictor_mut());
+        State {
             backend,
             hwnd: 0,
-            canvas: None,
-            width: initial_w,
-            height: initial_h,
-            pos_x: initial_pos_x,
-            pos_y: initial_pos_y,
+            surface: None,
+            key_cache: None,
+            width: if config.width >= MIN_W { config.width } else { default_w },
+            height: if config.height >= MIN_H { config.height } else { default_h },
+            pos_x: config.pos_x,
+            pos_y: config.pos_y,
             px: 0,
             py: 0,
             inside: false,
-            pressed: -1,
-            press_time: 0,
-            hold_fired: false,
+            interaction: Interaction::Idle,
+            drag_origin: (0, 0),
             flash_key: -1,
             flash_until: 0,
-            moving: false,
-            resizing: false,
-            rsz_w: 0,
-            rsz_h: 0,
-            grab_lx: 0,
-            grab_ly: 0,
-            grab_sx: 0,
-            grab_sy: 0,
-            shown_x: initial_pos_x,
-            shown_y: initial_pos_y,
-            rep_key: -1,
-            rep_next: 0,
-            grid_cols: 0,
-            mods: ModifierEngine::new(),
-            predictor: Predictor::new(),
-            charmap: CharMap::new(),
-            dirty: false,
+            grid_cols,
+            handle_hover: false,
+            handle_anim_since: None,
+            ctl,
             last_hot: 0,
             last_geom: (-1, -1, -1, -1),
             sugg: [Rect::default(); 5],
@@ -761,136 +284,105 @@ impl State {
             layout_rect: Rect::default(),
             theme_rect: Rect::default(),
             close_rect: Rect::default(),
-            layout_idx: initial_layout_idx,
-            theme_idx: initial_theme_idx,
-            theme,
+            layout_idx,
+            theme_idx,
+            theme: THEMES[theme_idx],
             theme_menu_open: false,
             theme_menu_rect: Rect::default(),
             theme_item_rects: [Rect::default(); 12],
-            tab_accepts_prediction: config.tab_accepts_prediction,
             tab_toggle_rect: Rect::default(),
-            prediction: config.prediction,
             pred_toggle_rect: Rect::default(),
-            dict_menu_open: false,
-            dict_page: 0,
-            dict_rect: Rect::default(),
-            dict_menu_rect: Rect::default(),
-            dict_tab_toggle_rect: Rect::default(),
-            dict_clear_rect: Rect::default(),
-            dict_prev_rect: Rect::default(),
-            dict_next_rect: Rect::default(),
-            dict_remove_rects: [Rect::default(); 8],
-            dict_words: [None; 8],
-            n_dict_items: 0,
+            mic_rect: Rect::default(),
             #[cfg(feature = "dictation")]
             dict_state: DictState::Idle,
             #[cfg(feature = "dictation")]
             recorder: None,
             #[cfg(feature = "dictation")]
             dict_rx: None,
-            mic_rect: Rect::default(),
+            #[cfg(feature = "dictation")]
+            dict_frame_due: 0,
             quit: false,
-        };
-        state.compute_grid_cols();
-        state
+        }
     }
 
     fn save_config(&self) {
-        let config = PersistentConfig {
+        PersistentConfig {
             theme: self.theme.name.to_string(),
             layout: self.layout().name.to_string(),
             pos_x: self.pos_x,
             pos_y: self.pos_y,
             width: self.width,
             height: self.height,
-            tab_accepts_prediction: self.tab_accepts_prediction,
-            prediction: self.prediction,
-        };
-        config.save();
+            tab_accepts_prediction: self.ctl.tab_accepts_prediction(),
+            prediction: self.ctl.prediction(),
+        }
+        .save();
+    }
+
+    /// Persist learned history when a commit flagged it dirty. A failed
+    /// write is user-facing and must not be silent.
+    fn save_history(&mut self) {
+        if let Err(e) = save_history_if_dirty(self.ctl.predictor_mut()) {
+            warn!("osk: saving learned history failed: {e}");
+        }
     }
 
     fn layout(&self) -> &'static Layout {
-        ALL_LAYOUTS[self.layout_idx]
+        render::layout_at(self.layout_idx)
     }
 
-    fn compute_grid_cols(&mut self) {
-        let layout = self.layout();
-        let mut cols = 0;
-        for row in layout.rows {
-            let total: i32 = row.keys.iter().map(|k| k.width as i32).sum();
-            if total > cols {
-                cols = total;
-            }
+    // ---- handle hover ease ----
+
+    /// When the handle hover state flips, timestamp the flip so the
+    /// arc's ease runs from the transition.
+    fn sync_handle_anim(&mut self) {
+        let hov = self.view().handle_hov();
+        if hov != self.handle_hover {
+            // A reversal mid-ease continues from the arc's current look
+            // (t = 1 - cbrt(1 - y) inverts ease_out_cubic).
+            let shown = self.handle_anim();
+            let from = if hov { shown } else { 1.0 - shown };
+            let t0 = 1.0 - (1.0 - from).cbrt();
+            let back = (t0 * render::HANDLE_ANIM_MS as f64) as u64;
+            self.handle_hover = hov;
+            self.handle_anim_since = Some(now_ms().saturating_sub(back));
+            self.request_redraw();
         }
-        self.grid_cols = cols;
+    }
+
+    fn handle_anim(&self) -> f64 {
+        let Some(since) = self.handle_anim_since else {
+            return 0.0;
+        };
+        let t = render::anim_progress(now_ms(), since, render::HANDLE_ANIM_MS);
+        if self.handle_hover {
+            t
+        } else {
+            1.0 - t
+        }
+    }
+
+    fn handle_anim_active(&self) -> bool {
+        self.handle_anim_since
+            .is_some_and(|since| now_ms().saturating_sub(since) < render::HANDLE_ANIM_MS)
     }
 
     // ---- geometry ----
 
-    /// Pixels per 1.0u key, with the bezel margin on both sides.
-    fn unit_x(&self) -> f64 {
-        if self.width <= 0 {
-            return 0.0;
-        }
-        let cols_u = self.grid_cols as f64 / 20.0;
-        self.width as f64 / (cols_u + 2.0 * MARGIN_U)
-    }
-
-    fn bar_h(&self) -> f64 {
-        BAR_U * self.unit_x()
-    }
-
-    fn row_h(&self) -> f64 {
-        if self.height <= 0 {
-            return 0.0;
-        }
-        let layout = self.layout();
-        ((self.height as f64 - self.bar_h() - 2.0 * MARGIN_U * self.unit_x())
-            / layout.rows.len() as f64)
-            .max(1.0)
-    }
-
-    /// The smaller of the horizontal unit and the row height. Every
-    /// drawn metric (gap, radius, font) scales with it, so a resize
-    /// scales the whole keyboard and the layout holds at any size.
-    fn k(&self) -> f64 {
-        self.unit_x().min(self.row_h())
-    }
-
-    fn key_rect(&self, r: usize, i: usize) -> (f64, f64, f64, f64) {
-        let layout = self.layout();
-        let u = self.unit_x();
-        let row_h = self.row_h();
-        let row_total: i32 = layout.rows[r].keys.iter().map(|k| k.width as i32).sum();
-        let mut col = (self.grid_cols - row_total) / 2;
-        for j in 0..i {
-            col += layout.rows[r].keys[j].width as i32;
-        }
-        (
-            MARGIN_U * u + col as f64 / 20.0 * u,
-            self.bar_h() + MARGIN_U * u + r as f64 * row_h,
-            layout.rows[r].keys[i].width as f64 / 20.0 * u,
-            row_h,
-        )
-    }
-
     fn key_at(&self, x: i32, y: i32) -> Option<usize> {
-        if y < self.bar_h() as i32 || self.width == 0 {
-            return None;
-        }
-        if self.dict_menu_open && self.dict_menu_rect.contains(x as f64, y as f64) {
+        let v = self.view();
+        if y < v.bar_h() as i32 || self.width == 0 {
             return None;
         }
         if self.theme_menu_open && self.theme_menu_rect.contains(x as f64, y as f64) {
             return None;
         }
-        let layout = self.layout();
-        for (r, row) in layout.rows.iter().enumerate() {
+        for (r, row) in self.layout().rows.iter().enumerate() {
             for (i, k) in row.keys.iter().enumerate() {
-                if k.code == 0 {
+                if k.is_gap() {
                     continue;
                 }
-                let (rx, ry, rw, rh) = self.key_rect(r, i);
+                let (rx, ry, rw, rh) = v.key_rect(r, i);
                 if (x as f64) >= rx
                     && (x as f64) < rx + rw
                     && (y as f64) >= ry
@@ -903,86 +395,121 @@ impl State {
         None
     }
 
-    /// Side of the bottom-right resize handle, in logical pixels.
-    fn handle_size(&self) -> i32 {
-        if self.width <= 0 {
-            return 24;
-        }
-        ((0.5 * self.unit_x()).max(24.0)) as i32
-    }
-
-    fn handle_hov(&self) -> bool {
-        self.inside
-            && self.width > 0
-            && self.px >= self.width - self.handle_size()
-            && self.py >= self.height - self.handle_size()
-    }
-
     fn key_of(&self, idx: usize) -> &Key {
         &self.layout().rows[idx / 100].keys[idx % 100]
     }
 
     fn apply_geometry(&mut self) {
         let geom = (self.pos_x, self.pos_y, self.width, self.height);
-        // Identical re-sends are skipped so a stationary pointer during a
-        // drag costs no API traffic.
+        // Identical re-sends are skipped so a stationary pointer during
+        // a drag costs nothing.
         if geom == self.last_geom {
             return;
         }
         let size_changed = self.width != self.last_geom.2 || self.height != self.last_geom.3;
         self.last_geom = geom;
-        if self.hwnd != 0 {
-            let mut flags = SWP_NOZORDER | SWP_NOACTIVATE;
-            if !size_changed {
-                flags |= SWP_NOSIZE;
-            }
-            let _ = unsafe {
-                SetWindowPos(
-                    HWND(self.hwnd as *mut _),
-                    None,
-                    self.pos_x,
-                    self.pos_y,
-                    self.width,
-                    self.height,
-                    flags,
-                )
-            };
+        if self.hwnd == 0 {
+            return;
         }
+        let mut flags = SWP_NOZORDER | SWP_NOACTIVATE;
+        if !size_changed {
+            flags |= SWP_NOSIZE;
+        }
+        let _ = unsafe {
+            SetWindowPos(
+                HWND(self.hwnd as *mut _),
+                None,
+                self.pos_x,
+                self.pos_y,
+                self.width,
+                self.height,
+                flags,
+            )
+        };
+    }
+
+    /// The drawing snapshot for this frame: exactly what the render
+    /// module's painters read. Hit testing reads the same geometry
+    /// through it, so the drawn and hit rects cannot drift.
+    fn view(&self) -> View<'_> {
+        View {
+            width: self.width,
+            height: self.height,
+            buf_w: self.width,
+            buf_h: self.height,
+            theme: self.theme,
+            theme_idx: self.theme_idx,
+            layout_idx: self.layout_idx,
+            grid_cols: self.grid_cols,
+            interaction: self.interaction,
+            flash_key: self.flash_key,
+            px: self.px,
+            py: self.py,
+            inside: self.inside,
+            handle_anim: self.handle_anim(),
+            theme_menu_open: self.theme_menu_open,
+            ctl: &self.ctl,
+            via: ViaFrame {
+                chip: ViaChipLook::Hidden,
+                status: None,
+            },
+            #[cfg(feature = "dictation")]
+            dict_state: self.dict_state,
+            #[cfg(feature = "dictation")]
+            levels: self.wave_levels(),
+        }
+    }
+
+    #[cfg(feature = "dictation")]
+    fn wave_levels(&self) -> Vec<f32> {
+        if self.dict_state == DictState::Recording {
+            if let Some(rec) = self.recorder.as_ref() {
+                return rec.levels(render::WAVE_BARS);
+            }
+        }
+        Vec::new()
     }
 
     // ---- redraw ----
 
     /// Mark the window invalid; the message loop turns that into a
-    /// `WM_PAINT` that calls [`State::render`].
+    /// `WM_PAINT`, which coalesces any number of requests.
     fn request_redraw(&self) {
         if self.hwnd != 0 {
             let _ = unsafe { InvalidateRect(Some(HWND(self.hwnd as *mut _)), None, false) };
         }
     }
 
-    /// Draw the keyboard into the back buffer and blit it to the window.
-    fn render(&mut self) {
-        if self.width <= 0 || self.height <= 0 || self.hwnd == 0 {
+    /// Paint right away: a tap shows its press without waiting for the
+    /// message queue.
+    fn redraw_now(&self) {
+        self.request_redraw();
+        if self.hwnd != 0 {
+            let _ = unsafe { UpdateWindow(HWND(self.hwnd as *mut _)) };
+        }
+    }
+
+    /// Draw the frame into the back buffer and copy it to `hdc`.
+    fn paint_to(&mut self, hdc: *mut std::ffi::c_void) {
+        if self.width <= 0 || self.height <= 0 {
             return;
         }
-        let mut canvas = match self.canvas.take() {
-            Some(c) if c.w == self.width && c.h == self.height => c,
-            _ => match Canvas::new_bitmap(self.width, self.height) {
-                Some(c) => c,
-                None => return,
+        let surface = match self.surface.take() {
+            Some(s) if s.width() == self.width && s.height() == self.height => s,
+            _ => match ImageSurface::create(Format::ARgb32, self.width, self.height) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("osk: back buffer {}x{}: {e}", self.width, self.height);
+                    return;
+                }
             },
         };
-        canvas.clear();
-        let bar = self.measure_bar(&mut canvas);
-        self.paint(&mut canvas, &bar);
-        let hwnd = HWND(self.hwnd as *mut _);
-        let hdc = unsafe { GetDC(Some(hwnd)) };
-        canvas.blit_to_hdc(hdc.0);
-        unsafe {
-            ReleaseDC(Some(hwnd), hdc);
-        }
-        self.canvas = Some(canvas);
-        self.dirty = false;
+        let Some(bar) = self.draw(&surface) else {
+            self.surface = Some(surface);
+            return;
+        };
+        surface.blit_to_hdc(hdc);
+        self.surface = Some(surface);
         self.sugg = bar.sugg;
         self.n_sugg = bar.n_sugg;
         self.layout_rect = bar.layout_rect;
@@ -993,165 +520,93 @@ impl State {
         self.theme_item_rects = bar.theme_item_rects;
         self.tab_toggle_rect = bar.tab_toggle_rect;
         self.pred_toggle_rect = bar.pred_toggle_rect;
-        self.dict_rect = bar.dict_rect;
-        self.dict_menu_rect = bar.dict_menu_rect;
-        self.dict_tab_toggle_rect = bar.dict_tab_toggle_rect;
-        self.dict_clear_rect = bar.dict_clear_rect;
-        self.dict_prev_rect = bar.dict_prev_rect;
-        self.dict_next_rect = bar.dict_next_rect;
-        self.dict_remove_rects = bar.dict_remove_rects;
-        self.dict_words = bar.dict_words;
-        self.n_dict_items = bar.n_dict_items;
+        self.last_hot = self.hot_sig();
     }
 
-    /// Render the keyboard to a PPM file (headless verification).
-    pub fn render_to_ppm(&mut self, path: &str) -> bool {
-        let rows = self.layout().rows.len() as f64;
-        if self.width < MIN_W {
-            self.width = ((self.grid_cols as f64 / 20.0 + 2.0 * MARGIN_U) * U0 + 0.5) as i32;
-        }
-        if self.height < MIN_H {
-            self.height = ((BAR_U + rows + 2.0 * MARGIN_U) * U0 + 0.5) as i32;
-        }
-        let Some(mut canvas) = Canvas::new_bitmap(self.width, self.height) else {
-            return false;
-        };
-        canvas.clear();
-        let bar = self.measure_bar(&mut canvas);
-        self.paint(&mut canvas, &bar);
-        canvas.dump_ppm(path)
+    /// Measure the bar and paint the view into `surface`.
+    fn draw(&mut self, surface: &ImageSurface) -> Option<BarLayout> {
+        let meas = Context::new(surface).ok()?;
+        meas.select_font_face(FONT, FontSlant::Normal, FontWeight::Normal);
+        let bar = self.view().measure_bar(&meas);
+        drop(meas);
+        let cr = Context::new(surface).ok()?;
+        // Out of self while the view borrows it.
+        let mut cache = self.key_cache.take();
+        self.view().paint(&cr, &bar, &mut cache);
+        self.key_cache = cache;
+        Some(bar)
     }
 
-    // ---- injection ----
+    // ---- input ----
 
-    /// Press a key with any active modifiers held, then release them.
-    /// Latched modifiers are consumed by this one key; locked ones stay.
     fn tap_key(&mut self, idx: usize) {
         let k = *self.key_of(idx);
-        if k.code == 0 {
-            return;
-        }
-        let is_mod = k.moment || k.toggle;
-        let shift_active = self.mods.shift_active();
-        // When enabled, Tab accepts the top suggestion (like clicking
-        // the first pill); Shift+Tab passes through as a plain TAB.
-        // By default Tab is a normal Tab key.
-        if self.prediction
-            && self.tab_accepts_prediction
-            && k.code == key::KEY_TAB
-            && !shift_active
-            && !self.predictor.suggestions().is_empty()
-        {
-            self.click_suggestion(0);
-            self.render();
-            return;
-        }
-        let caps = self.mods.caps_lock();
-        let sticky = self.mods.sticky();
-        let mut ev = [OskEvent {
-            code: 0,
-            press: false,
-        }; TAP_MAX_EVENTS];
-        let Ok(n) = tap_events(&k, shift_active, caps, &sticky, &mut ev) else {
-            return;
+        let mut sink = BackendSink {
+            b: self.backend.as_mut(),
         };
-        for e in &ev[..n] {
-            if e.press {
-                self.backend.press(e.code);
-            } else {
-                self.backend.release(e.code);
-            }
-        }
-        self.mods.consume_latched();
-        if self.prediction {
-            match k.code {
-                key::KEY_BACKSPACE => self.predictor.backspace(),
-                key::KEY_SPACE => self.predictor.space(),
-                _ => {
-                    // A single-character label (letters, symbols, arrows)
-                    // feeds the predictor; multi-char labels (pgdn, esc)
-                    // and modifiers break the word.
-                    let single = k.label.and_then(|l| {
-                        let mut it = l.chars();
-                        match (it.next(), it.next()) {
-                            (Some(c), None) => Some(c),
-                            _ => None,
-                        }
-                    });
-                    if k.letter {
-                        if let Some(c) = k.label.and_then(|l| l.chars().next()) {
-                            self.predictor.char(c);
-                        }
-                    } else if let Some(c) = single {
-                        self.predictor.char(c);
-                    } else if !is_mod {
-                        self.predictor.break_word();
-                    }
-                }
-            }
-        }
-        // A tap repaints immediately.
-        self.render();
+        self.ctl.tap_key(&k, &mut sink);
+        self.redraw_now();
+        self.save_history();
     }
 
     fn click_suggestion(&mut self, idx: usize) {
-        let suggs = self.predictor.suggestions();
-        let Some(word) = suggs.get(idx).copied() else {
-            return;
-        };
-        let Some(map) = &self.charmap else {
-            return;
-        };
-        let partial = self.predictor.partial().to_string();
-        let shift_active = self.mods.shift_active();
-        let caps = self.mods.caps_lock();
-        let mut out = [0 as char; 64];
-        let Some(n) = complete_word(word, &partial, shift_active, caps, &mut out) else {
-            return;
-        };
-        let text: String = out[..n].iter().collect();
         let mut sink = BackendSink {
-            b: &mut *self.backend,
+            b: self.backend.as_mut(),
         };
-        let _ = type_string(&mut sink, map, &text, || {});
-        self.mods.consume_latched();
-        self.predictor.commit(word);
+        self.ctl.commit_suggestion(idx, &mut sink).ok();
+        self.save_history();
         self.request_redraw();
     }
 
-    // ---- pointer ----
+    /// Feed one interaction event through the pure state machine and
+    /// apply the side effects it reports (flash, geometry, config save).
+    fn interact(&mut self, ev: IEvent) {
+        let step = interaction::step(self.interaction, ev);
+        if let Some(key) = step.flash {
+            self.flash_key = key as i32;
+            self.flash_until = now_ms() + FLASH_MS;
+            self.request_redraw();
+        }
+        if step.apply_geometry {
+            self.apply_geometry();
+        }
+        if step.save_config {
+            self.save_config();
+        }
+        self.interaction = step.next;
+    }
+
+    /// The pointer in screen coordinates; drags and resizes follow it.
+    fn cursor() -> (i32, i32) {
+        let mut pt = POINT::default();
+        let _ = unsafe { GetCursorPos(&mut pt) };
+        (pt.x, pt.y)
+    }
 
     fn on_motion(&mut self) {
-        if self.rep_key >= 0 && self.key_at(self.px, self.py) != Some(self.rep_key as usize) {
-            self.rep_key = -1;
-        }
-        if self.moving {
-            let mut pt = POINT::default();
-            let _ = unsafe { GetCursorPos(&mut pt) };
-            let nx = self.shown_x + (pt.x - self.grab_sx);
-            let ny = self.shown_y + (pt.y - self.grab_sy);
-            if nx != self.pos_x || ny != self.pos_y {
-                self.pos_x = nx;
-                self.pos_y = ny;
-                self.apply_geometry();
+        self.sync_handle_anim();
+        // A repeat stops once the pointer leaves the repeating key, but
+        // the key stays pressed (its held look is time-based).
+        if let Interaction::Press {
+            key,
+            rep_next: Some(_),
+            ..
+        } = self.interaction
+        {
+            if self.key_at(self.px, self.py) != Some(key) {
+                if let Interaction::Press { rep_next, .. } = &mut self.interaction {
+                    *rep_next = None;
+                }
             }
-            return;
         }
-        if self.resizing {
-            let mut pt = POINT::default();
-            let _ = unsafe { GetCursorPos(&mut pt) };
-            let w = (self.rsz_w + (pt.x - self.grab_sx)).max(MIN_W);
-            let h = (self.rsz_h + (pt.y - self.grab_sy)).max(MIN_H);
-            if w != self.width || h != self.height {
-                self.width = w;
-                self.height = h;
-                self.apply_geometry();
-                self.request_redraw();
+        match self.interaction {
+            Interaction::Move { .. } | Interaction::Resize { .. } => {
+                self.drag_to(Self::cursor());
+                return;
             }
-            return;
+            Interaction::Press { .. } | Interaction::Idle => {}
         }
-        // Moving inside the same key (or the bar gap) does not change a
-        // pixel; skip the redraw.
+        // Moving inside the same key does not change a pixel.
         let sig = self.hot_sig();
         if sig != self.last_hot {
             self.last_hot = sig;
@@ -1159,372 +614,236 @@ impl State {
         }
     }
 
+    /// Follow the pointer at screen position `pt` while dragging or
+    /// resizing. Both started from the screen position in the
+    /// interaction's grab point.
+    fn drag_to(&mut self, (x, y): (i32, i32)) {
+        match self.interaction {
+            Interaction::Move { grab_x, grab_y, .. } => {
+                let nx = self.drag_origin.0 + (x - grab_x);
+                let ny = self.drag_origin.1 + (y - grab_y);
+                if nx != self.pos_x || ny != self.pos_y {
+                    self.pos_x = nx;
+                    self.pos_y = ny;
+                    self.apply_geometry();
+                }
+            }
+            Interaction::Resize {
+                grab_x,
+                grab_y,
+                w,
+                h,
+            } => {
+                // Stretch limit: past the key aspect's edge the window
+                // stops growing in that direction.
+                let (cw, ch) = Metrics::clamp_size(
+                    (w + (x - grab_x)).max(MIN_W),
+                    (h + (y - grab_y)).max(MIN_H),
+                    self.grid_cols,
+                    self.layout().rows.len(),
+                );
+                let (nw, nh) = (cw.max(MIN_W), ch.max(MIN_H));
+                if nw != self.width || nh != self.height {
+                    self.width = nw;
+                    self.height = nh;
+                    self.apply_geometry();
+                    self.request_redraw();
+                }
+            }
+            Interaction::Press { .. } | Interaction::Idle => {}
+        }
+    }
+
     /// Signature of the hovered elements, for redraw coalescing.
     fn hot_sig(&self) -> u32 {
-        let key = self
-            .key_at(self.px, self.py)
-            .map(|k| k as u32)
-            .unwrap_or(0x3ff);
+        let at = |r: &Rect| u32::from(r.contains(self.px as f64, self.py as f64));
+        let key = self.key_at(self.px, self.py).map_or(0x3ff, |k| k as u32);
         let sugg = (0..self.n_sugg)
             .find(|&i| self.sugg[i].contains(self.px as f64, self.py as f64))
-            .map(|i| i as u32)
-            .unwrap_or(0x1f);
-        let close = self.close_rect.contains(self.px as f64, self.py as f64) as u32;
-        let layout_hov = self.layout_rect.contains(self.px as f64, self.py as f64) as u32;
-        let theme_hov = self.theme_rect.contains(self.px as f64, self.py as f64) as u32;
+            .map_or(0x1f, |i| i as u32);
         let menu_item = (0..12)
             .find(|&i| self.theme_item_rects[i].contains(self.px as f64, self.py as f64))
-            .map(|i| i as u32)
-            .unwrap_or(0xf);
-        let menu_open = self.theme_menu_open as u32;
-        let dict_hov = self.dict_rect.contains(self.px as f64, self.py as f64) as u32;
-        let dict_menu_open = self.dict_menu_open as u32;
-        let dict_item = if self.dict_menu_open {
-            let mut h = 0u32;
-            if self.dict_tab_toggle_rect.contains(self.px as f64, self.py as f64) {
-                h = 1;
-            } else if self.dict_clear_rect.contains(self.px as f64, self.py as f64) {
-                h = 2;
-            } else if self.dict_prev_rect.contains(self.px as f64, self.py as f64) {
-                h = 3;
-            } else if self.dict_next_rect.contains(self.px as f64, self.py as f64) {
-                h = 4;
-            } else if let Some(i) = (0..self.n_dict_items)
-                .find(|&i| self.dict_remove_rects[i].contains(self.px as f64, self.py as f64))
-            {
-                h = 5 + i as u32;
-            }
-            h
-        } else {
-            0
-        };
-        let handle = self.handle_hov() as u32;
-        let mic_hov = self.mic_rect.contains(self.px as f64, self.py as f64) as u32;
-        let tab_hov = self.tab_toggle_rect.contains(self.px as f64, self.py as f64) as u32;
-        let pred_hov = self.pred_toggle_rect.contains(self.px as f64, self.py as f64) as u32;
+            .map_or(0xf, |i| i as u32);
         (key << 20)
             | (sugg << 15)
-            | (layout_hov << 10)
-            | (theme_hov << 9)
-            | (menu_open << 8)
+            | (at(&self.pred_toggle_rect) << 12)
+            | (at(&self.tab_toggle_rect) << 11)
+            | (at(&self.layout_rect) << 10)
+            | (at(&self.theme_rect) << 9)
+            | (u32::from(self.theme_menu_open) << 8)
             | (menu_item << 4)
-            | (mic_hov << 2)
-            | (close << 1)
-            | (dict_menu_open << 12)
-            | (dict_hov << 11)
-            | (tab_hov << 13)
-            | (pred_hov << 14)
-            | (dict_item << 28)
-            | handle
+            | (at(&self.mic_rect) << 2)
+            | (at(&self.close_rect) << 1)
+            | u32::from(self.view().handle_hov())
     }
 
     fn cycle_layout(&mut self) {
-        self.pressed = -1;
-        self.rep_key = -1;
+        self.interaction = Interaction::Idle;
         self.layout_idx = (self.layout_idx + 1) % ALL_LAYOUTS.len();
-        self.compute_grid_cols();
-        self.width = self.width.max(MIN_W);
-        self.height = self.height.max(MIN_H);
+        self.grid_cols = render::grid_cols(self.layout());
+        // The new grid wants its own stretch limit.
+        let (w, h) = Metrics::clamp_size(
+            self.width.max(MIN_W),
+            self.height.max(MIN_H),
+            self.grid_cols,
+            self.layout().rows.len(),
+        );
+        self.width = w.max(MIN_W);
+        self.height = h.max(MIN_H);
         self.apply_geometry();
         self.save_config();
         self.request_redraw();
     }
 
+    // One pointer-press dispatcher: hit-test order mirrors the visual
+    // layering, as on Linux.
+    #[allow(clippy::too_many_lines)]
     fn on_button(&mut self, pressed: bool) {
-        if pressed {
-            if self.dict_menu_open {
-                if self.dict_tab_toggle_rect.contains(self.px as f64, self.py as f64) {
-                    self.tab_accepts_prediction = !self.tab_accepts_prediction;
-                    self.save_config();
-                    self.request_redraw();
-                    return;
-                }
-                if self.dict_clear_rect.contains(self.px as f64, self.py as f64) {
-                    self.predictor.clear_learned();
-                    self.predictor.break_word();
-                    self.dict_page = 0;
-                    self.save_config();
-                    self.request_redraw();
-                    return;
-                }
-                if self.dict_prev_rect.contains(self.px as f64, self.py as f64) {
-                    if self.dict_page > 0 {
-                        self.dict_page -= 1;
-                    }
-                    self.request_redraw();
-                    return;
-                }
-                if self.dict_next_rect.contains(self.px as f64, self.py as f64) {
-                    self.dict_page += 1;
-                    self.request_redraw();
-                    return;
-                }
-                for i in 0..self.n_dict_items {
-                    if self.dict_remove_rects[i].contains(self.px as f64, self.py as f64) {
-                        if let Some(w) = self.dict_words[i] {
-                            self.predictor.forget_word(w);
-                            self.save_config();
-                            self.request_redraw();
-                            return;
-                        }
-                    }
-                }
-                if self.dict_rect.contains(self.px as f64, self.py as f64) {
-                    self.dict_menu_open = false;
-                    self.request_redraw();
-                    return;
-                }
-                if !self.dict_menu_rect.contains(self.px as f64, self.py as f64) {
-                    self.dict_menu_open = false;
-                    self.request_redraw();
-                    return;
-                }
-                // Inside the menu without hitting a button: no action.
-                return;
-            }
-            if self.theme_menu_open {
-                // Prediction on/off toggle
-                if self.pred_toggle_rect.contains(self.px as f64, self.py as f64) {
-                    self.prediction = !self.prediction;
-                    if !self.prediction {
-                        self.predictor.break_word();
-                    }
-                    self.save_config();
-                    self.request_redraw();
-                    return;
-                }
-                // Tab accepts-prediction toggle
-                if self.tab_toggle_rect.contains(self.px as f64, self.py as f64) {
-                    self.tab_accepts_prediction = !self.tab_accepts_prediction;
-                    self.save_config();
-                    self.request_redraw();
-                    return;
-                }
-                // Check if user clicked an item in the menu
-                for i in 0..12 {
-                    if self.theme_item_rects[i].contains(self.px as f64, self.py as f64) {
-                        self.theme_idx = i;
-                        self.theme = THEMES[i];
-                        self.theme_menu_open = false;
-                        self.dict_menu_open = false;
-                        self.save_config();
-                        self.request_redraw();
-                        return;
-                    }
-                }
-                // Check if user clicked the theme button again
-                if self.theme_rect.contains(self.px as f64, self.py as f64) {
-                    self.theme_menu_open = false;
-                    self.dict_menu_open = false;
-                    self.request_redraw();
-                    return;
-                }
-                // Clicked outside: close the menu
+        if !pressed {
+            // Release the held key (flash it) or end and persist the drag.
+            self.interact(IEvent::Release);
+            return;
+        }
+        let (x, y) = (self.px as f64, self.py as f64);
+        if self.theme_menu_open {
+            if self.pred_toggle_rect.contains(x, y) {
+                self.ctl.set_prediction(!self.ctl.prediction());
+            } else if self.tab_toggle_rect.contains(x, y) {
+                self.ctl.set_tab_accepts_prediction(!self.ctl.tab_accepts_prediction());
+            } else if let Some(i) = (0..THEMES.len().min(12)).find(|&i| self.theme_item_rects[i].contains(x, y)) {
+                self.theme_idx = i;
+                self.theme = THEMES[i];
                 self.theme_menu_open = false;
-                self.dict_menu_open = false;
-                self.request_redraw();
-                return;
-            }
-
-            // mic (dictation)
-            #[cfg(feature = "dictation")]
-            if self.mic_rect.contains(self.px as f64, self.py as f64) {
-                self.on_mic();
-                return;
-            }
-
-            // close
-            if self.close_rect.contains(self.px as f64, self.py as f64) {
-                self.save_config();
-                self.quit = true;
-                return;
-            }
-            // dict chip
-            if self.dict_rect.contains(self.px as f64, self.py as f64) {
-                self.dict_menu_open = true;
+            } else {
+                // The theme button again, or outside: close the menu.
                 self.theme_menu_open = false;
                 self.request_redraw();
                 return;
             }
-            // theme icon button
-            if self.theme_rect.contains(self.px as f64, self.py as f64) {
-                self.theme_menu_open = true;
-                self.dict_menu_open = false;
-                self.request_redraw();
-                return;
+            self.save_config();
+            self.request_redraw();
+            return;
+        }
+        #[cfg(feature = "dictation")]
+        if self.mic_rect.contains(x, y) {
+            self.on_mic();
+            return;
+        }
+        if self.close_rect.contains(x, y) {
+            self.save_config();
+            self.quit = true;
+            return;
+        }
+        if self.theme_rect.contains(x, y) {
+            self.theme_menu_open = true;
+            self.request_redraw();
+            return;
+        }
+        if self.layout_rect.contains(x, y) {
+            self.cycle_layout();
+            return;
+        }
+        if let Some(i) = (0..self.n_sugg).find(|&i| self.sugg[i].contains(x, y)) {
+            self.click_suggestion(self.sugg[i].idx);
+            return;
+        }
+        let (sx, sy) = Self::cursor();
+        let hs = self.view().handle_size();
+        if self.px >= self.width - hs && self.py >= self.height - hs {
+            self.interact(IEvent::StartResize {
+                x: sx,
+                y: sy,
+                w: self.width,
+                h: self.height,
+            });
+            return;
+        }
+        if self.py < self.view().bar_h() as i32 {
+            self.drag_origin = (self.pos_x, self.pos_y);
+            self.interact(IEvent::StartMove { x: sx, y: sy });
+            return;
+        }
+        let Some(k) = self.key_at(self.px, self.py) else {
+            return;
+        };
+        let key = *self.key_of(k);
+        // All keyboard logic lives in the controller.
+        let mut sink = BackendSink {
+            b: self.backend.as_mut(),
+        };
+        match self.ctl.click_key(&key, now_ms(), &mut sink) {
+            Clicked::Inert => {}
+            Clicked::Momentary => {
+                self.interact(IEvent::Press {
+                    key: k,
+                    repeat: false,
+                    now: now_ms(),
+                });
+                self.redraw_now();
             }
-            // layout chip
-            if self.layout_rect.contains(self.px as f64, self.py as f64) {
-                self.cycle_layout();
-                return;
-            }
-            // suggestion chips
-            for i in 0..self.n_sugg {
-                if self.sugg[i].contains(self.px as f64, self.py as f64) {
-                    self.click_suggestion(self.sugg[i].idx);
-                    return;
-                }
-            }
-            // resize handle (bottom-right corner)
-            let hs = self.handle_size();
-            if self.px >= self.width - hs && self.py >= self.height - hs {
-                self.pressed = -1;
-                self.rep_key = -1;
-                self.resizing = true;
-                let mut pt = POINT::default();
-                let _ = unsafe { GetCursorPos(&mut pt) };
-                self.grab_sx = pt.x;
-                self.grab_sy = pt.y;
-                self.grab_lx = self.px;
-                self.grab_ly = self.py;
-                self.rsz_w = self.width;
-                self.rsz_h = self.height;
-                return;
-            }
-            // bar -> drag the surface
-            if self.py < self.bar_h() as i32 {
-                self.pressed = -1;
-                self.rep_key = -1;
-                self.moving = true;
-                let mut pt = POINT::default();
-                let _ = unsafe { GetCursorPos(&mut pt) };
-                self.grab_sx = pt.x;
-                self.grab_sy = pt.y;
-                self.grab_lx = self.px;
-                self.grab_ly = self.py;
-                self.shown_x = self.pos_x;
-                self.shown_y = self.pos_y;
-                return;
-            }
-            let Some(k) = self.key_at(self.px, self.py) else {
-                return;
-            };
-            let key = *self.key_of(k);
-            // Win and Alt are momentary: one press injects one press+release
-            // and the keycap shows the press, then returns to normal. No
-            // latch. Alt must be a standalone press+release so Unity-style
-            // mouse-mode toggles fire; latching it for the next key would
-            // swallow the tap.
-            if mod_index(key.code) == Some(MOD_META)
-                || mod_index(key.code) == Some(MOD_ALT)
-            {
-                self.pressed = k as i32;
-                self.press_time = now_ms();
-                self.hold_fired = false;
-                self.backend.press(key.code);
-                self.backend.release(key.code);
-                self.request_redraw();
-                return;
-            }
-            // modifier key (shift/ctrl/alt): run the 3-state machine
-            // (OFF -> LATCHED -> LOCKED -> OFF; double-click locks)
-            if mod_index(key.code).is_some() {
-                self.mods.click(key.code, now_ms());
+            Clicked::Latch(..) | Clicked::Caps(_) => {
                 self.flash_key = k as i32;
                 self.flash_until = now_ms() + FLASH_MS;
                 self.request_redraw();
-                return;
             }
-            if key.toggle {
-                // caps lock
-                self.mods.toggle_caps();
-                self.flash_key = k as i32;
-                self.flash_until = now_ms() + FLASH_MS;
-                self.request_redraw();
-                return;
-            }
-            self.pressed = k as i32;
-            self.press_time = now_ms();
-            self.hold_fired = false;
-            self.tap_key(k);
-            if key.repeat {
-                self.rep_key = k as i32;
-                self.rep_next = now_ms() + 500;
-            }
-        } else {
-            self.rep_key = -1;
-            self.hold_fired = false;
-            if self.pressed >= 0 {
-                self.flash_key = self.pressed;
-                self.flash_until = now_ms() + FLASH_MS;
-                self.pressed = -1;
-                self.request_redraw();
-            }
-            // End the drag; apply_geometry() guarantees the final
-            // position is committed if the drag ended mid-frame.
-            if self.moving || self.resizing {
-                self.moving = false;
-                self.resizing = false;
-                self.apply_geometry();
-                self.save_config();
+            Clicked::Tapped { .. } => {
+                self.interact(IEvent::Press {
+                    key: k,
+                    repeat: key.repeat,
+                    now: now_ms(),
+                });
+                self.redraw_now();
+                self.save_history();
             }
         }
     }
 
     /// Right-click a suggestion pill to forget that word.
     fn on_right_click(&mut self) {
-        for i in 0..self.n_sugg {
-            if self.sugg[i].contains(self.px as f64, self.py as f64) {
-                let suggs = self.predictor.suggestions();
-                if let Some(&word) = suggs.get(self.sugg[i].idx) {
-                    self.predictor.forget_word(word);
-                    self.save_config();
-                    self.request_redraw();
-                    return;
-                }
-            }
+        let (x, y) = (self.px as f64, self.py as f64);
+        let Some(i) = (0..self.n_sugg).find(|&i| self.sugg[i].contains(x, y)) else {
+            return;
+        };
+        if let Some(&word) = self.ctl.suggestions().get(self.sugg[i].idx) {
+            self.ctl.forget_word(word);
+            self.save_history();
+            self.request_redraw();
         }
     }
 
-    // ---- repeat ----
-
-    fn handle_repeat(&mut self) {
-        if self.rep_key < 0 {
+    /// The pointer left the window. During a drag or resize the window
+    /// holds the mouse capture and moves under the pointer, so a leave
+    /// then is not the end of the gesture.
+    fn on_leave(&mut self) {
+        if matches!(self.interaction, Interaction::Move { .. } | Interaction::Resize { .. }) {
             return;
         }
-        let now = now_ms();
-        if now >= self.rep_next {
-            self.tap_key(self.rep_key as usize);
-            self.rep_next = now + 40;
-        }
+        self.inside = false;
+        self.interact(IEvent::Leave);
+        self.sync_handle_anim();
+        self.request_redraw();
     }
 
-    fn handle_flash(&mut self) {
-        if self.flash_key >= 0 && now_ms() >= self.flash_until {
-            self.flash_key = -1;
-            self.request_redraw();
-        }
-    }
+    // ---- dictation ----
 
-    fn handle_hold(&mut self) {
-        if self.pressed >= 0 && !self.hold_fired && now_ms() >= self.press_time + 200 {
-            self.hold_fired = true;
-            self.request_redraw();
-        }
-    }
-
-    /// Mic button: start/stop dictation.
+    /// Mic button: start or stop dictation.
     #[cfg(feature = "dictation")]
     fn on_mic(&mut self) {
         match self.dict_state {
-            DictState::Idle => {
-                match crate::dictate::Recorder::start() {
-                    Ok(rec) => {
-                        self.recorder = Some(rec);
-                        self.dict_state = DictState::Recording;
-                        self.request_redraw();
-                    }
-                    Err(e) => eprintln!("[dictate] {e}"),
+            DictState::Idle => match crate::dictate::Recorder::start() {
+                Ok(rec) => {
+                    self.recorder = Some(rec);
+                    self.dict_state = DictState::Recording;
+                    self.dict_frame_due = now_ms();
+                    self.request_redraw();
                 }
-            }
+                Err(e) => warn!("[dictate] {e}"),
+            },
             DictState::Recording => {
-                let rec = match self.recorder.take() {
-                    Some(r) => r,
-                    None => {
-                        self.dict_state = DictState::Idle;
-                        self.request_redraw();
-                        return;
-                    }
+                let Some(rec) = self.recorder.take() else {
+                    self.dict_state = DictState::Idle;
+                    self.request_redraw();
+                    return;
                 };
                 let rate = rec.rate;
                 let raw = rec.stop();
@@ -1534,8 +853,7 @@ impl State {
                 self.request_redraw();
                 std::thread::spawn(move || {
                     let pcm = crate::dictate::resample_to_16k(&raw, rate as usize);
-                    let result = crate::dictate::transcribe(&pcm);
-                    let _ = tx.send(result);
+                    let _ = tx.send(crate::dictate::transcribe(&pcm));
                 });
             }
             DictState::Transcribing => {}
@@ -1546,1131 +864,172 @@ impl State {
     #[cfg(feature = "dictation")]
     fn finish_dictation(&mut self, result: Result<String, String>) {
         self.dict_state = DictState::Idle;
+        self.dict_rx = None;
         self.request_redraw();
         match result {
             Ok(text) if !text.is_empty() => {
-                if let Some(map) = self.charmap.as_ref() {
+                if let Some(map) = self.ctl.charmap() {
                     let pause = || std::thread::sleep(std::time::Duration::from_millis(20));
-                    let mut sink = BackendSink {
-                        b: &mut *self.backend,
-                    };
-                    if let Err(e) = oskwin_core::typekey::type_text(
-                        &mut sink,
+                    if let Err(e) = type_text(
+                        &mut BackendSink {
+                            b: self.backend.as_mut(),
+                        },
                         map,
                         &text,
                         pause,
                     ) {
-                        eprintln!("[dictate] failed to type: {e:?}");
+                        warn!("[dictate] failed to type: {e:?}");
                     }
                 }
             }
             Ok(_) => {}
-            Err(e) => eprintln!("[dictate] {e}"),
+            Err(e) => warn!("[dictate] {e}"),
         }
     }
 
-    #[cfg(feature = "dictation")]
-    fn handle_dictation(&mut self) {
-        if let Some(rx) = self.dict_rx.as_ref() {
-            if let Ok(result) = rx.try_recv() {
+    // ---- timed work ----
+
+    /// Everything the timer services: key repeat, the held look, the
+    /// flash, the controller's deferred Win tap, the handle ease, the
+    /// waveform and a finished transcription.
+    fn tick(&mut self) {
+        let now = now_ms();
+        let repeat = match &mut self.interaction {
+            Interaction::Press {
+                key,
+                rep_next: Some(next),
+                ..
+            } if now >= *next => {
+                *next = now + 40;
+                Some(*key)
+            }
+            _ => None,
+        };
+        if let Some(k) = repeat {
+            self.tap_key(k);
+        }
+        if let Interaction::Press {
+            press_time,
+            hold_fired,
+            ..
+        } = &mut self.interaction
+        {
+            if !*hold_fired && now >= *press_time + interaction::HOLD_MS {
+                *hold_fired = true;
+                self.request_redraw();
+            }
+        }
+        if self.flash_key >= 0 && now >= self.flash_until {
+            self.flash_key = -1;
+            self.request_redraw();
+        }
+        let mut sink = BackendSink {
+            b: self.backend.as_mut(),
+        };
+        self.ctl.tick(now, &mut sink);
+        if self.handle_anim_since.is_some_and(|s| now.saturating_sub(s) <= render::HANDLE_ANIM_MS + ANIM_FRAME_MS) {
+            self.request_redraw();
+        }
+        #[cfg(feature = "dictation")]
+        {
+            if self.dict_state == DictState::Recording && now >= self.dict_frame_due {
+                self.request_redraw();
+                self.dict_frame_due = now + DICT_FRAME_MS;
+            }
+            let done = self.dict_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+            if let Some(result) = done {
                 self.finish_dictation(result);
-                self.dict_rx = None;
             }
         }
+        self.backend.pump();
     }
 
-    #[cfg(not(feature = "dictation"))]
-    fn handle_dictation(&mut self) {}
-
-    // ---- painting ----
-
-    /// Measure the bar elements (suggestions, layout, theme icon, close)
-    /// and store their rects for hit testing.
-    fn measure_bar(&self, cr: &mut Canvas) -> BarLayout {
-        let mut bar = BarLayout {
-            sugg: [Rect::default(); 5],
-            n_sugg: 0,
-            layout_rect: Rect::default(),
-            theme_rect: Rect::default(),
-            close_rect: Rect::default(),
-            theme_menu_rect: Rect::default(),
-            theme_item_rects: [Rect::default(); 12],
-            dict_rect: Rect::default(),
-            dict_menu_rect: Rect::default(),
-            dict_tab_toggle_rect: Rect::default(),
-            dict_clear_rect: Rect::default(),
-            dict_prev_rect: Rect::default(),
-            dict_next_rect: Rect::default(),
-            dict_remove_rects: [Rect::default(); 8],
-            dict_words: [None; 8],
-            n_dict_items: 0,
-            mic_rect: Rect::default(),
-            pred_toggle_rect: Rect::default(),
-            tab_toggle_rect: Rect::default(),
-        };
-        let bh = self.bar_h();
-        let k = self.k();
-        let fs = 0.34 * k;
-        let chip_fs = 0.30 * k;
-        let side_pad = 0.35 * k;
-
-        // 1. Close button on the far right
-        let cw = 0.6 * k;
-        let cx = self.width as f64 - cw - MARGIN_U * k;
-        bar.close_rect = Rect {
-            x: cx,
-            y: 0.0,
-            w: cw,
-            h: bh,
-            idx: 0,
-        };
-
-        let chip_pad = 0.20 * k;
-        let chip_gap = 0.08 * k;
-
-        // 2. Theme icon button
-        let th_w = 0.75 * k;
-        let th_x = cx - th_w - chip_gap;
-        bar.theme_rect = Rect {
-            x: th_x,
-            y: 0.0,
-            w: th_w,
-            h: bh,
-            idx: 0,
-        };
-
-        // 2b. Mic button (dictation), left of the theme icon.
+    /// Milliseconds until the timer has work, or None when nothing is
+    /// due, so an idle keyboard arms no timer.
+    fn next_wake(&self) -> Option<u64> {
+        let now = now_ms();
+        let mut due: Vec<u64> = Vec::new();
+        if let Interaction::Press {
+            press_time,
+            hold_fired,
+            rep_next,
+            ..
+        } = self.interaction
+        {
+            due.extend(rep_next);
+            if !hold_fired {
+                due.push(press_time + interaction::HOLD_MS);
+            }
+        }
+        if self.flash_key >= 0 {
+            due.push(self.flash_until);
+        }
+        due.extend(self.ctl.tick_due());
+        if self.handle_anim_active() {
+            due.push(now + ANIM_FRAME_MS);
+        }
         #[cfg(feature = "dictation")]
-        let (_mic_x, next_anchor) = {
-            let mic_w = 0.75 * k;
-            let mx = th_x - mic_w - chip_gap;
-            bar.mic_rect = Rect {
-                x: mx,
-                y: 0.0,
-                w: mic_w,
-                h: bh,
-                idx: 0,
-            };
-            (mx, mx)
-        };
-        #[cfg(not(feature = "dictation"))]
-        let next_anchor = th_x;
+        match self.dict_state {
+            DictState::Recording => due.push(self.dict_frame_due),
+            // Poll for the result while a transcription runs.
+            DictState::Transcribing => due.push(now + 50),
+            DictState::Idle => {}
+        }
+        due.into_iter().min().map(|d| d.saturating_sub(now).max(1))
+    }
 
-        // 3. Dict chip
-        let dict_label = "Dict";
-        let dict_tw = self.text_w(cr, dict_label, chip_fs);
-        let dict_w = dict_tw + 2.0 * chip_pad;
-        let dict_x = next_anchor - dict_w - chip_gap;
-        bar.dict_rect = Rect {
-            x: dict_x,
-            y: 0.0,
-            w: dict_w,
-            h: bh,
-            idx: 0,
-        };
-
-        // 4. Layout chip (e.g. "65%", "65%+Num")
-        let lo_label = self.layout().name;
-        let lo_tw = self.text_w(cr, lo_label, chip_fs);
-        let lo_w = lo_tw + 2.0 * chip_pad;
-        let lo_x = dict_x - lo_w - chip_gap;
-        bar.layout_rect = Rect {
-            x: lo_x,
-            y: 0.0,
-            w: lo_w,
-            h: bh,
-            idx: 0,
-        };
-
-        // 4. Centered word prediction
-        let suggs: Vec<&'static str> = if self.prediction {
-            self.predictor.suggestions()
-        } else {
-            Vec::new()
-        };
-        let avail_left = MARGIN_U * k + 0.1 * k;
-        let avail_right = (lo_x - 0.2 * k).max(avail_left);
-        if !suggs.is_empty() && avail_right > avail_left + 60.0 {
-            let max_avail_w = avail_right - avail_left;
-            let pill_gap = 0.12 * k;
-
-            let slot_candidates: &[&[usize]] = if suggs.len() >= 5 {
-                &[&[2, 1, 0, 3, 4], &[1, 0, 2], &[0]]
-            } else if suggs.len() >= 3 {
-                &[&[1, 0, 2], &[0]]
-            } else if suggs.len() == 2 {
-                &[&[0, 1], &[0]]
-            } else {
-                &[&[0]]
-            };
-
-            for candidates in slot_candidates {
-                let mut widths = Vec::with_capacity(candidates.len());
-                let mut total_w = 0.0;
-                for &idx in *candidates {
-                    let word = suggs.get(idx).copied().unwrap_or("");
-                    let tw = self.text_w(cr, word, fs);
-                    let pw = if idx == 0 {
-                        (tw + 2.8 * side_pad).max(1.8 * k)
-                    } else {
-                        (tw + 1.8 * side_pad).max(1.3 * k)
-                    };
-                    widths.push(pw);
-                    total_w += pw;
+    /// Arm the timer for the next deadline, or stop it.
+    fn arm_timer(&self) {
+        if self.hwnd == 0 {
+            return;
+        }
+        let hwnd = HWND(self.hwnd as *mut _);
+        unsafe {
+            match self.next_wake() {
+                Some(ms) => {
+                    SetTimer(Some(hwnd), TIMER_ID, ms.min(u64::from(u32::MAX)) as u32, None);
                 }
-                total_w += (widths.len() as f64 - 1.0).max(0.0) * pill_gap;
-
-                if total_w <= max_avail_w || candidates.len() == 1 {
-                    let center_x = self.width as f64 / 2.0;
-                    let mut start_x = center_x - total_w / 2.0;
-                    if start_x < avail_left {
-                        start_x = avail_left;
-                    }
-                    if start_x + total_w > avail_right {
-                        start_x = (avail_right - total_w).max(avail_left);
-                    }
-
-                    bar.n_sugg = 0;
-                    for (i, &idx) in candidates.iter().enumerate() {
-                        let pw = widths[i];
-                        if bar.n_sugg < 5 {
-                            bar.sugg[bar.n_sugg] = Rect {
-                                x: start_x,
-                                y: 0.0,
-                                w: pw,
-                                h: bh,
-                                idx,
-                            };
-                            bar.n_sugg += 1;
-                        }
-                        start_x += pw + pill_gap;
-                    }
-                    break;
+                None => {
+                    let _ = KillTimer(Some(hwnd), TIMER_ID);
                 }
             }
         }
-
-        // 6. Theme dropdown menu layout (2 toggle rows + 2 columns x 6 rows)
-        if self.theme_menu_open {
-            let col_w = 110.0;
-            let row_h = 25.0;
-            let col_gap = 6.0;
-            let row_gap = 4.0;
-            let pad = 8.0;
-            let toggle_h = 26.0;
-            let toggle_gap = 8.0;
-
-            let menu_w = 2.0 * col_w + col_gap + 2.0 * pad;
-            let menu_h = pad + 2.0 * (toggle_h + toggle_gap) + 6.0 * row_h + 5.0 * row_gap + pad;
-
-            let menu_right = (th_x + th_w).min(self.width as f64 - MARGIN_U * k);
-            let menu_x = (menu_right - menu_w).max(MARGIN_U * k);
-            let menu_y = bh + 2.0;
-
-            bar.theme_menu_rect = Rect {
-                x: menu_x,
-                y: menu_y,
-                w: menu_w,
-                h: menu_h,
-                idx: 0,
-            };
-
-            // Prediction on/off toggle (top row)
-            bar.pred_toggle_rect = Rect {
-                x: menu_x + pad,
-                y: menu_y + pad,
-                w: menu_w - 2.0 * pad,
-                h: toggle_h,
-                idx: 0,
-            };
-
-            // Tab accepts-prediction toggle (second row)
-            bar.tab_toggle_rect = Rect {
-                x: menu_x + pad,
-                y: menu_y + pad + toggle_h + toggle_gap,
-                w: menu_w - 2.0 * pad,
-                h: toggle_h,
-                idx: 0,
-            };
-
-            for idx in 0..12 {
-                let col = idx / 6;
-                let row = idx % 6;
-                let ix = menu_x + pad + col as f64 * (col_w + col_gap);
-                let iy = menu_y + pad + 2.0 * (toggle_h + toggle_gap) + row as f64 * (row_h + row_gap);
-                bar.theme_item_rects[idx] = Rect {
-                    x: ix,
-                    y: iy,
-                    w: col_w,
-                    h: row_h,
-                    idx,
-                };
-            }
-        }
-
-        // 7. Dict menu layout
-        if self.dict_menu_open {
-            let menu_w = 260.0;
-            let pad = 8.0;
-            let header_h = 26.0;
-            let toggle_h = 24.0;
-            let item_h = 22.0;
-            let footer_h = 24.0;
-
-            let words = self.predictor.learned_words();
-            let total_pages = if words.is_empty() {
-                1
-            } else {
-                (words.len() + 7) / 8
-            };
-            let page = self.dict_page.min(total_pages.saturating_sub(1));
-            let n_items = words.len().saturating_sub(page * 8).min(8);
-            let rows = n_items.max(if words.is_empty() { 1 } else { 0 });
-
-            let menu_right = (dict_x + dict_w).min(self.width as f64 - MARGIN_U * k);
-            let menu_x = (menu_right - menu_w).max(MARGIN_U * k);
-            let menu_y = bh + 2.0;
-            let menu_h = header_h + toggle_h + rows as f64 * item_h + footer_h;
-
-            bar.dict_menu_rect = Rect {
-                x: menu_x,
-                y: menu_y,
-                w: menu_w,
-                h: menu_h,
-                idx: 0,
-            };
-
-            bar.dict_tab_toggle_rect = Rect {
-                x: menu_x + pad,
-                y: menu_y + header_h,
-                w: menu_w - 2.0 * pad,
-                h: toggle_h,
-                idx: 0,
-            };
-
-            for i in 0..8 {
-                if i < n_items {
-                    bar.dict_words[i] = Some(words[page * 8 + i].word);
-                    bar.dict_remove_rects[i] = Rect {
-                        x: menu_x + menu_w - pad - 24.0,
-                        y: menu_y + header_h + toggle_h + i as f64 * item_h,
-                        w: 24.0,
-                        h: item_h,
-                        idx: i,
-                    };
-                } else {
-                    bar.dict_words[i] = None;
-                }
-            }
-            bar.n_dict_items = n_items;
-
-            let footer_y = menu_y + header_h + toggle_h + rows as f64 * item_h;
-            bar.dict_clear_rect = Rect {
-                x: menu_x + pad,
-                y: footer_y,
-                w: 90.0,
-                h: footer_h,
-                idx: 0,
-            };
-            if total_pages > 1 {
-                bar.dict_next_rect = Rect {
-                    x: menu_x + menu_w - pad - 28.0,
-                    y: footer_y,
-                    w: 28.0,
-                    h: footer_h,
-                    idx: 0,
-                };
-                bar.dict_prev_rect = Rect {
-                    x: bar.dict_next_rect.x - 34.0,
-                    y: footer_y,
-                    w: 28.0,
-                    h: footer_h,
-                    idx: 0,
-                };
-            }
-        }
-
-        bar
-    }
-
-    fn paint(&self, cr: &mut Canvas, bar: &BarLayout) {
-        cr.reset_clip();
-        cr.select_font_face(FONT, 0, 0);
-        self.paint_window(cr);
-        self.paint_bar(cr, bar);
-        let layout = self.layout();
-        for (r, row) in layout.rows.iter().enumerate() {
-            for (i, key) in row.keys.iter().enumerate() {
-                let (rx, ry, rw, rh) = self.key_rect(r, i);
-                self.paint_key(cr, rx, ry, rw, rh, key, r * 100 + i);
-            }
-        }
-        self.paint_handle(cr);
-        // A single hairline around the panel.
-        cr.new_path();
-        rrect(
-            cr,
-            0.5,
-            0.5,
-            self.width as f64 - 1.0,
-            self.height as f64 - 1.0,
-            (CASE_RAD_U * self.k()).max(1.0),
-        );
-        set_src(cr, self.theme.edge);
-        cr.set_line_width(1.0);
-        let _ = cr.stroke();
-        if self.theme_menu_open {
-            self.paint_theme_menu(cr, bar);
-        }
-        if self.dict_menu_open {
-            self.paint_dict_menu(cr, bar);
-        }
-    }
-
-    fn paint_window(&self, cr: &mut Canvas) {
-        set_src_rgba(cr, self.theme.case, self.theme.opacity);
-        rrect(
-            cr,
-            0.0,
-            0.0,
-            self.width as f64,
-            self.height as f64,
-            CASE_RAD_U * self.k(),
-        );
-        let _ = cr.fill();
-    }
-
-    fn draw_centered(&self, cr: &mut Canvas, s: &str, cx: f64, cy: f64, size: f64, color: u32) {
-        cr.set_font_size(size);
-        let Some(ext) = cr.text_extents(s) else {
-            return;
-        };
-        set_src(cr, color);
-        cr.move_to(
-            cx - ext.width() / 2.0 - ext.x_bearing(),
-            cy - ext.height() / 2.0 - ext.y_bearing(),
-        );
-        let _ = cr.show_text(s);
-    }
-
-    #[allow(dead_code)]
-    fn draw_left(&self, cr: &mut Canvas, s: &str, x: f64, cy: f64, size: f64, color: u32) {
-        cr.set_font_size(size);
-        let Some(ext) = cr.text_extents(s) else {
-            return;
-        };
-        set_src(cr, color);
-        cr.move_to(x - ext.x_bearing(), cy - ext.height() / 2.0 - ext.y_bearing());
-        let _ = cr.show_text(s);
-    }
-
-    fn text_w(&self, cr: &mut Canvas, s: &str, size: f64) -> f64 {
-        cr.set_font_size(size);
-        cr.text_extents(s).map(|e| e.width()).unwrap_or(0.0)
-    }
-
-    fn paint_chip(&self, cr: &mut Canvas, r: &Rect, label: &str, font_size: f64, bh: f64) {
-        if r.w <= 0.0 {
-            return;
-        }
-        let hov = self.inside && r.contains(self.px as f64, self.py as f64);
-        let pad_y = bh * 0.16;
-        let chip_h = bh - 2.0 * pad_y;
-        let bg = if hov { self.theme.key_hov } else { self.theme.key_mod };
-        let fg = if hov { self.theme.keytxt } else { self.theme.modtxt };
-        rrect(cr, r.x, pad_y, r.w, chip_h, chip_h * 0.35);
-        set_src(cr, bg);
-        let _ = cr.fill();
-        self.draw_centered(cr, label, r.x + r.w / 2.0, bh / 2.0, font_size, fg);
-    }
-
-    fn paint_bar(&self, cr: &mut Canvas, bar: &BarLayout) {
-        let bh = self.bar_h();
-        let k = self.k();
-        let fs = 0.34 * k;
-        let _ = cr.save();
-        cr.rectangle(0.0, 0.0, self.width as f64, bh);
-        cr.clip();
-        rrect(cr, 0.0, 0.0, self.width as f64, self.height as f64, CASE_RAD_U * k);
-        cr.clip();
-        set_src_rgba(cr, self.theme.case, self.theme.opacity);
-        cr.rectangle(0.0, 0.0, self.width as f64, bh);
-        let _ = cr.fill();
-        let suggs = self.predictor.suggestions();
-        let pad_y = 0.12 * bh;
-        let ry = pad_y;
-        let rh = bh - 2.0 * pad_y;
-        let rad = (KEY_RAD_U * k * 0.70).min(rh / 2.0);
-
-        for i in 0..bar.n_sugg {
-            let r = bar.sugg[i];
-            let hov = self.inside && r.contains(self.px as f64, self.py as f64);
-            let is_primary = r.idx == 0;
-            let word = suggs.get(r.idx).copied().unwrap_or("");
-            if word.is_empty() {
-                continue;
-            }
-
-            let rx = r.x;
-            let rw = r.w;
-
-            let (bg, fg, border) = if is_primary {
-                if hov {
-                    (self.theme.key_press, self.theme.ink, None)
-                } else {
-                    (self.theme.on_bg, self.theme.on_txt, Some(self.theme.accent))
-                }
-            } else {
-                if hov {
-                    (self.theme.key_hov, self.theme.accent, Some(self.theme.accent))
-                } else {
-                    (self.theme.key, self.theme.keytxt, Some(self.theme.edge))
-                }
-            };
-
-            cr.new_path();
-            rrect(cr, rx, ry, rw, rh, rad);
-            set_src_rgba(cr, bg, self.theme.opacity);
-            let _ = cr.fill();
-
-            if let Some(bcolor) = border {
-                cr.new_path();
-                rrect(cr, rx + 0.5, ry + 0.5, rw - 1.0, rh - 1.0, rad);
-                set_src_rgba(cr, bcolor, (self.theme.opacity * 0.7).min(1.0));
-                cr.set_line_width(1.0);
-                let _ = cr.stroke();
-            }
-
-            let weight = if is_primary { 1 } else { 0 };
-            cr.select_font_face(FONT, 0, weight);
-            self.draw_centered(cr, word, rx + rw / 2.0, bh / 2.0, fs, fg);
-        }
-
-        // Layout chip
-        self.paint_chip(
-            cr,
-            &bar.layout_rect,
-            self.layout().name,
-            0.30 * k,
-            bh,
-        );
-
-        // Dict chip
-        self.paint_chip(cr, &bar.dict_rect, "Dict", 0.30 * k, bh);
-        if self.dict_menu_open {
-            let pad_y = bh * 0.16;
-            let chip_h = bh - 2.0 * pad_y;
-            rrect(
-                cr,
-                bar.dict_rect.x + 0.5,
-                pad_y + 0.5,
-                bar.dict_rect.w - 1.0,
-                chip_h - 1.0,
-                chip_h * 0.35,
-            );
-            set_src(cr, self.theme.accent);
-            cr.set_line_width(1.0);
-            let _ = cr.stroke();
-        }
-
-        // Theme icon button
-        let th_hov = self.inside && bar.theme_rect.contains(self.px as f64, self.py as f64);
-        let th_active = self.theme_menu_open;
-        let (th_bg, th_fg) = if th_active || th_hov {
-            (self.theme.on_bg, self.theme.accent)
-        } else {
-            (self.theme.key_mod, self.theme.modtxt)
-        };
-        let pad_y = bh * 0.16;
-        let chip_h = bh - 2.0 * pad_y;
-        rrect(cr, bar.theme_rect.x, pad_y, bar.theme_rect.w, chip_h, chip_h * 0.35);
-        set_src(cr, th_bg);
-        let _ = cr.fill();
-        if th_active {
-            rrect(
-                cr,
-                bar.theme_rect.x + 0.5,
-                pad_y + 0.5,
-                bar.theme_rect.w - 1.0,
-                chip_h - 1.0,
-                chip_h * 0.35,
-            );
-            set_src(cr, self.theme.accent);
-            cr.set_line_width(1.0);
-            let _ = cr.stroke();
-        }
-        let icon_cx = bar.theme_rect.x + bar.theme_rect.w / 2.0;
-        let icon_cy = bh / 2.0;
-        self.draw_palette_icon(cr, icon_cx, icon_cy, 0.17 * k, th_fg);
-
-        // Mic button (dictation)
-        #[cfg(feature = "dictation")]
-        {
-            let mic_hov = self.inside && bar.mic_rect.contains(self.px as f64, self.py as f64);
-            let active = self.dict_state != DictState::Idle;
-            let (mic_bg, mic_fg) = if active {
-                (self.theme.accent, self.theme.on_bg)
-            } else if mic_hov {
-                (self.theme.on_bg, self.theme.accent)
-            } else {
-                (self.theme.key_mod, self.theme.modtxt)
-            };
-            let pad_y = bh * 0.16;
-            let chip_h = bh - 2.0 * pad_y;
-            rrect(cr, bar.mic_rect.x, pad_y, bar.mic_rect.w, chip_h, chip_h * 0.35);
-            set_src(cr, mic_bg);
-            let _ = cr.fill();
-            let mic_cx = bar.mic_rect.x + bar.mic_rect.w / 2.0;
-            let mic_cy = bh / 2.0;
-            self.draw_mic_icon(cr, mic_cx, mic_cy, k, mic_fg);
-        }
-
-        let close_hov = self.inside && bar.close_rect.contains(self.px as f64, self.py as f64);
-        self.draw_centered(
-            cr,
-            "\u{00d7}",
-            bar.close_rect.x + bar.close_rect.w / 2.0,
-            bh / 2.0,
-            0.4 * k,
-            if close_hov { 0xffffff } else { self.theme.close },
-        );
-        let _ = cr.restore();
-    }
-
-    fn draw_palette_icon(&self, cr: &mut Canvas, cx: f64, cy: f64, r: f64, color: u32) {
-        set_src(cr, color);
-        cr.new_path();
-        cr.arc(cx, cy, r, 0.0, 2.0 * std::f64::consts::PI);
-        cr.set_line_width(1.4);
-        let _ = cr.stroke();
-
-        let dot_r = 0.22 * r;
-        let dist = 0.50 * r;
-        for &deg in &[35.0, 120.0, 215.0] {
-            let rad = deg * std::f64::consts::PI / 180.0;
-            let dx = cx + dist * rad.cos();
-            let dy = cy + dist * rad.sin();
-            cr.new_path();
-            cr.arc(dx, dy, dot_r, 0.0, 2.0 * std::f64::consts::PI);
-            let _ = cr.fill();
-        }
-    }
-
-    /// A simple microphone glyph: capsule body, holder bracket, stem, and base.
-    #[cfg(feature = "dictation")]
-    fn draw_mic_icon(&self, cr: &mut Canvas, cx: f64, cy: f64, k: f64, color: u32) {
-        set_src(cr, color);
-        let w = 0.14 * k;
-        let h = 0.22 * k;
-        let top = cy - 0.17 * k;
-        // Capsule body
-        rrect(cr, cx - w / 2.0, top, w, h, w / 2.0);
-        let _ = cr.fill();
-        // Holder bracket
-        let r = 0.12 * k;
-        let u_top = cy - 0.05 * k;
-        let u_bot = cy + 0.07 * k;
-        cr.new_path();
-        cr.set_line_width(1.4);
-        cr.move_to(cx - r, u_top);
-        cr.line_to(cx - r, u_bot);
-        cr.line_to(cx + r, u_bot);
-        cr.line_to(cx + r, u_top);
-        // Stem down
-        cr.move_to(cx, u_bot);
-        cr.line_to(cx, u_bot + 0.06 * k);
-        // Base plate
-        let bw = 0.10 * k;
-        cr.move_to(cx - bw / 2.0, u_bot + 0.06 * k);
-        cr.line_to(cx + bw / 2.0, u_bot + 0.06 * k);
-        let _ = cr.stroke();
-    }
-
-    fn paint_theme_menu(&self, cr: &mut Canvas, bar: &BarLayout) {
-        if !self.theme_menu_open || bar.theme_menu_rect.w <= 0.0 {
-            return;
-        }
-        let mr = &bar.theme_menu_rect;
-        let k = self.k();
-
-        let _ = cr.save();
-        // Drop shadow behind menu
-        cr.new_path();
-        rrect(cr, mr.x + 2.0, mr.y + 3.0, mr.w, mr.h, 8.0);
-        set_src_rgba(cr, 0x000000, 0.45);
-        let _ = cr.fill();
-
-        // Menu background panel (using current theme's dark case)
-        cr.new_path();
-        rrect(cr, mr.x, mr.y, mr.w, mr.h, 8.0);
-        set_src(cr, self.theme.case);
-        let _ = cr.fill();
-
-        // Menu border outline in accent
-        cr.new_path();
-        rrect(cr, mr.x + 0.5, mr.y + 0.5, mr.w - 1.0, mr.h - 1.0, 8.0);
-        set_src_rgba(cr, self.theme.accent, 0.50);
-        cr.set_line_width(1.0);
-        let _ = cr.stroke();
-
-        // Draw 12 theme cards
-        let fs = 0.24 * k;
-        // Prediction on/off toggle (top row)
-        {
-            let pr = &bar.pred_toggle_rect;
-            let pr_hov = self.inside && pr.contains(self.px as f64, self.py as f64);
-            let active = self.prediction;
-            let (bg, fg) = if active {
-                (self.theme.on_bg, self.theme.accent)
-            } else if pr_hov {
-                (self.theme.key_hov, self.theme.keytxt)
-            } else {
-                (self.theme.key_mod, self.theme.modtxt)
-            };
-            cr.new_path();
-            rrect(cr, pr.x, pr.y, pr.w, pr.h, 5.0);
-            set_src(cr, bg);
-            let _ = cr.fill();
-            if active {
-                cr.new_path();
-                rrect(cr, pr.x + 0.5, pr.y + 0.5, pr.w - 1.0, pr.h - 1.0, 5.0);
-                set_src(cr, self.theme.accent);
-                cr.set_line_width(1.0);
-                let _ = cr.stroke();
-            }
-            cr.select_font_face(FONT, 0, if active { 1 } else { 0 });
-            self.draw_left(cr, "Word prediction", pr.x + 10.0, pr.y + pr.h / 2.0, fs, fg);
-            self.draw_centered(cr, if active { "on" } else { "off" }, pr.x + pr.w - 16.0, pr.y + pr.h / 2.0, fs * 0.9, fg);
-        }
-        // Tab accepts-prediction toggle (second row)
-        {
-            let tr = &bar.tab_toggle_rect;
-            let tr_hov = self.inside && tr.contains(self.px as f64, self.py as f64);
-            let active = self.tab_accepts_prediction;
-            let (bg, fg) = if active {
-                (self.theme.on_bg, self.theme.accent)
-            } else if tr_hov {
-                (self.theme.key_hov, self.theme.keytxt)
-            } else {
-                (self.theme.key_mod, self.theme.modtxt)
-            };
-            cr.new_path();
-            rrect(cr, tr.x, tr.y, tr.w, tr.h, 5.0);
-            set_src(cr, bg);
-            let _ = cr.fill();
-            if active {
-                cr.new_path();
-                rrect(cr, tr.x + 0.5, tr.y + 0.5, tr.w - 1.0, tr.h - 1.0, 5.0);
-                set_src(cr, self.theme.accent);
-                cr.set_line_width(1.0);
-                let _ = cr.stroke();
-            }
-            cr.select_font_face(FONT, 0, if active { 1 } else { 0 });
-            self.draw_left(cr, "Tab accepts prediction", tr.x + 10.0, tr.y + tr.h / 2.0, fs, fg);
-            self.draw_centered(cr, if active { "on" } else { "off" }, tr.x + tr.w - 16.0, tr.y + tr.h / 2.0, fs * 0.9, fg);
-        }
-        for i in 0..12 {
-            let item = &bar.theme_item_rects[i];
-            let t = &THEMES[i];
-            let hov = self.inside && item.contains(self.px as f64, self.py as f64);
-            let is_cur = i == self.theme_idx;
-
-            let rx = item.x;
-            let ry = item.y;
-            let rw = item.w;
-            let rh = item.h;
-
-            // Card background in that theme's own case color!
-            cr.new_path();
-            rrect(cr, rx, ry, rw, rh, 5.0);
-            set_src(cr, t.case);
-            let _ = cr.fill();
-
-            // Border styling
-            cr.new_path();
-            rrect(cr, rx + 0.5, ry + 0.5, rw - 1.0, rh - 1.0, 5.0);
-            if is_cur {
-                set_src(cr, t.accent);
-                cr.set_line_width(1.5);
-                let _ = cr.stroke();
-            } else if hov {
-                set_src(cr, t.key_press);
-                cr.set_line_width(1.0);
-                let _ = cr.stroke();
-            } else {
-                set_src(cr, t.edge);
-                cr.set_line_width(1.0);
-                let _ = cr.stroke();
-            }
-
-            // Swatch dot on the left colored in that theme's key_press accent
-            let dot_x = rx + 10.0;
-            let dot_y = ry + rh / 2.0;
-            let dot_r = 4.0;
-            cr.new_path();
-            cr.arc(dot_x, dot_y, dot_r, 0.0, 2.0 * std::f64::consts::PI);
-            set_src(cr, t.key_press);
-            let _ = cr.fill();
-
-            // Theme name rendered in that theme's accent/keytxt
-            let weight = if is_cur || hov { 1 } else { 0 };
-            cr.select_font_face(FONT, 0, weight);
-            cr.set_font_size(fs);
-            let text_color = if is_cur { t.accent } else if hov { t.key_press } else { t.keytxt };
-            self.draw_left(cr, t.name, rx + 20.0, ry + rh / 2.0, fs, text_color);
-
-            // Active checkmark indicator on the right if current theme
-            if is_cur {
-                self.draw_centered(cr, "\u{2713}", rx + rw - 10.0, ry + rh / 2.0, fs * 0.9, t.accent);
-            }
-        }
-
-        let _ = cr.restore();
-    }
-
-    fn paint_dict_menu(&self, cr: &mut Canvas, bar: &BarLayout) {
-        if !self.dict_menu_open || bar.dict_menu_rect.w <= 0.0 {
-            return;
-        }
-        let mr = &bar.dict_menu_rect;
-        let k = self.k();
-        let fs = 0.24 * k;
-        let pad = 8.0;
-        let header_h = 26.0;
-        let toggle_h = 24.0;
-        let item_h = 22.0;
-        let footer_h = 24.0;
-
-        let words = self.predictor.learned_words();
-        let total = words.len();
-        let total_pages = if total == 0 {
-            1
-        } else {
-            (total + 7) / 8
-        };
-        let page = self.dict_page.min(total_pages.saturating_sub(1));
-
-        let _ = cr.save();
-        // Drop shadow behind the menu
-        cr.new_path();
-        rrect(cr, mr.x + 2.0, mr.y + 3.0, mr.w, mr.h, 8.0);
-        set_src_rgba(cr, 0x000000, 0.45);
-        let _ = cr.fill();
-
-        // Panel background with accent outline
-        cr.new_path();
-        rrect(cr, mr.x, mr.y, mr.w, mr.h, 8.0);
-        set_src(cr, self.theme.case);
-        let _ = cr.fill();
-        cr.new_path();
-        rrect(cr, mr.x + 0.5, mr.y + 0.5, mr.w - 1.0, mr.h - 1.0, 8.0);
-        set_src_rgba(cr, self.theme.accent, 0.50);
-        cr.set_line_width(1.0);
-        let _ = cr.stroke();
-
-        // Header
-        cr.select_font_face(FONT, 0, 1);
-        self.draw_left(
-            cr,
-            &format!("Learned Words ({total})"),
-            mr.x + pad,
-            mr.y + header_h / 2.0,
-            fs,
-            self.theme.on_txt,
-        );
-
-        // Tab behavior toggle
-        let tr = &bar.dict_tab_toggle_rect;
-        let tr_hov = self.inside && tr.contains(self.px as f64, self.py as f64);
-        let active = self.tab_accepts_prediction;
-        let (bg, fg) = if active {
-            (self.theme.on_bg, self.theme.accent)
-        } else if tr_hov {
-            (self.theme.key_hov, self.theme.keytxt)
-        } else {
-            (self.theme.key_mod, self.theme.modtxt)
-        };
-        cr.new_path();
-        rrect(cr, tr.x, tr.y, tr.w, tr.h, 5.0);
-        set_src(cr, bg);
-        let _ = cr.fill();
-        if active {
-            cr.new_path();
-            rrect(cr, tr.x + 0.5, tr.y + 0.5, tr.w - 1.0, tr.h - 1.0, 5.0);
-            set_src(cr, self.theme.accent);
-            cr.set_line_width(1.0);
-            let _ = cr.stroke();
-        }
-        cr.select_font_face(FONT, 0, if active { 1 } else { 0 });
-        self.draw_centered(
-            cr,
-            if active { "Tab: Predict" } else { "Tab: Normal" },
-            tr.x + tr.w / 2.0,
-            tr.y + tr.h / 2.0,
-            fs,
-            fg,
-        );
-
-        // Word rows
-        cr.select_font_face(FONT, 0, 0);
-        if total == 0 {
-            self.draw_centered(
-                cr,
-                "No learned words",
-                mr.x + mr.w / 2.0,
-                mr.y + header_h + toggle_h + item_h / 2.0,
-                fs,
-                self.theme.modtxt,
-            );
-        }
-        for i in 0..bar.n_dict_items {
-            let Some(word) = bar.dict_words[i] else {
-                continue;
-            };
-            let w = &words[page * 8 + i];
-            let ry = mr.y + header_h + toggle_h + i as f64 * item_h;
-            self.draw_left(cr, word, mr.x + pad, ry + item_h / 2.0, fs, self.theme.keytxt);
-            let count = format!("x{}", w.count);
-            let cw = self.text_w(cr, &count, fs);
-            self.draw_left(
-                cr,
-                &count,
-                bar.dict_remove_rects[i].x - cw - 6.0,
-                ry + item_h / 2.0,
-                fs,
-                self.theme.modtxt,
-            );
-            let rr = &bar.dict_remove_rects[i];
-            let rr_hov = self.inside && rr.contains(self.px as f64, self.py as f64);
-            self.draw_centered(
-                cr,
-                "\u{00d7}",
-                rr.x + rr.w / 2.0,
-                rr.y + rr.h / 2.0,
-                fs,
-                if rr_hov { 0xffffff } else { self.theme.close },
-            );
-        }
-
-        // Footer
-        let rows = bar.n_dict_items.max(if total == 0 { 1 } else { 0 });
-        let footer_y = mr.y + header_h + toggle_h + rows as f64 * item_h;
-        let clr = &bar.dict_clear_rect;
-        let clr_hov = self.inside && clr.contains(self.px as f64, self.py as f64);
-        cr.new_path();
-        rrect(cr, clr.x, clr.y, clr.w, clr.h, 5.0);
-        set_src(cr, if clr_hov { self.theme.key_hov } else { self.theme.key_mod });
-        let _ = cr.fill();
-        self.draw_centered(
-            cr,
-            "Clear All",
-            clr.x + clr.w / 2.0,
-            clr.y + clr.h / 2.0,
-            fs,
-            if clr_hov { self.theme.keytxt } else { self.theme.modtxt },
-        );
-        if total_pages > 1 {
-            let pr = &bar.dict_prev_rect;
-            let pr_hov = self.inside && pr.contains(self.px as f64, self.py as f64);
-            cr.new_path();
-            rrect(cr, pr.x, pr.y, pr.w, pr.h, 5.0);
-            set_src(cr, if pr_hov { self.theme.key_hov } else { self.theme.key_mod });
-            let _ = cr.fill();
-            self.draw_centered(
-                cr,
-                "\u{25c0}",
-                pr.x + pr.w / 2.0,
-                pr.y + pr.h / 2.0,
-                fs,
-                self.theme.keytxt,
-            );
-            let nr = &bar.dict_next_rect;
-            let nr_hov = self.inside && nr.contains(self.px as f64, self.py as f64);
-            cr.new_path();
-            rrect(cr, nr.x, nr.y, nr.w, nr.h, 5.0);
-            set_src(cr, if nr_hov { self.theme.key_hov } else { self.theme.key_mod });
-            let _ = cr.fill();
-            self.draw_centered(
-                cr,
-                "\u{25b6}",
-                nr.x + nr.w / 2.0,
-                nr.y + nr.h / 2.0,
-                fs,
-                self.theme.keytxt,
-            );
-            self.draw_centered(
-                cr,
-                &format!("Page {}/{}", page + 1, total_pages),
-                mr.x + mr.w / 2.0,
-                footer_y + footer_h / 2.0,
-                fs,
-                self.theme.modtxt,
-            );
-        }
-
-        let _ = cr.restore();
-    }
-
-    /// Three diagonal ticks in the bottom-right corner.
-    fn paint_handle(&self, cr: &mut Canvas) {
-        let hs = self.handle_size() as f64;
-        let hx = self.width as f64 - hs;
-        let hy = self.height as f64 - hs;
-        let hov = self.handle_hov();
-        let _ = cr.save();
-        cr.rectangle(hx, hy, hs, hs);
-        cr.clip();
-        set_src(cr, if hov { 0x888888 } else { 0x555555 });
-        for i in 0..3 {
-            let off = 0.25 * hs * i as f64;
-            cr.move_to(hx + 0.17 * hs + off, hy + hs - 0.17 * hs);
-            cr.line_to(hx + hs - 0.17 * hs, hy + 0.17 * hs + off);
-        }
-        cr.set_line_width(0.08 * hs);
-        let _ = cr.stroke();
-        let _ = cr.restore();
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn paint_key(&self, cr: &mut Canvas, rx: f64, ry: f64, rw: f64, rh: f64, key: &Key, idx: usize) {
-        // A code-0 key with no label is the 0.5u gap: nothing to draw.
-        if key.code == 0 && key.label.is_none() {
-            return;
-        }
-        let k = self.k();
-        let vis = self.mods.key_visual(key);
-        let on = vis == ModKeyState::Latched || vis == ModKeyState::Locked;
-        let pressed = self.pressed == idx as i32;
-        let flashed = self.flash_key == idx as i32;
-        let is_held = pressed && (self.rep_key == idx as i32 || now_ms().saturating_sub(self.press_time) >= 200);
-        let hov = key.code != 0
-            && self.inside
-            && (self.px as f64) >= rx
-            && (self.px as f64) < rx + rw
-            && (self.py as f64) >= ry
-            && (self.py as f64) < ry + rh;
-        // Three tiers: character keys (letters, digits, symbols, space)
-        // are lifted; modifiers are flat and dimmer; Enter is the only
-        // filled accent. Esc is a plain modifier.
-        let is_char = key.letter || key.shift_label.is_some() || key.code == key::KEY_SPACE;
-        let is_accent = key.code == key::KEY_ENTER;
-        // (fill, label) for the current state.
-        let (bg, label) = if is_held {
-            (self.theme.key_hold, self.theme.ink)
-        } else if pressed || flashed {
-            (self.theme.key_press, self.theme.ink)
-        } else if on {
-            (self.theme.on_bg, self.theme.on_txt)
-        } else if is_accent {
-            (self.theme.accent, self.theme.ink)
-        } else if is_char {
-            (if hov { self.theme.key_hov } else { self.theme.key }, self.theme.keytxt)
-        } else {
-            (self.theme.key_mod, if hov { self.theme.keytxt } else { self.theme.modtxt })
-        };
-        let disp: String;
-        if key.letter {
-            let c = key.label.and_then(|l| l.chars().next()).unwrap_or(' ');
-            let upper = self.mods.shift_active() ^ self.mods.caps_lock();
-            disp = if upper {
-                c.to_ascii_uppercase().to_string()
-            } else {
-                c.to_ascii_lowercase().to_string()
-            };
-        } else if let Some(l) = key.label {
-            disp = if self.mods.shift_active() {
-                key.shift_label.unwrap_or(l).to_string()
-            } else {
-                l.to_string()
-            };
-        } else {
-            disp = String::new();
-        }
-        let cx = rx + INSET_X_U * k;
-        let cy = ry + INSET_Y_U * k;
-        let cw = rw - 2.0 * INSET_X_U * k;
-        let ch = rh - 2.0 * INSET_Y_U * k;
-        let _ = cr.save();
-        cr.rectangle(rx, ry, rw, rh);
-        cr.clip();
-        rrect(cr, 0.0, 0.0, self.width as f64, self.height as f64, CASE_RAD_U * k);
-        cr.clip();
-        set_src_rgba(cr, self.theme.case, self.theme.opacity);
-        cr.rectangle(rx, ry, rw, rh);
-        let _ = cr.fill();
-        rrect(cr, cx, cy, cw, ch, KEY_RAD_U * k);
-        let key_alpha = if self.theme.opacity < 1.0 {
-            (self.theme.opacity + 0.08).min(1.0)
-        } else {
-            1.0
-        };
-        set_src_rgba(cr, bg, key_alpha);
-        let _ = cr.fill();
-        rrect(cr, cx + 0.5, cy + 0.5, cw - 1.0, ch - 1.0, KEY_RAD_U * k);
-        set_src_rgba(cr, self.theme.edge, key_alpha);
-        cr.set_line_width(1.0);
-        let _ = cr.stroke();
-        if !disp.is_empty() {
-            let mut fs = FONT_U * k;
-            for line in disp.lines() {
-                let n = line.chars().count().max(1) as f64;
-                fs = fs.min(cw / (0.62 * n));
-            }
-            let lines: Vec<&str> = disp.lines().collect();
-            if lines.len() == 1 {
-                self.draw_centered(cr, lines[0], rx + rw / 2.0, ry + rh / 2.0, fs, label);
-            } else {
-                let lh = 1.3 * fs;
-                let top = ry + rh / 2.0 - (lines.len() as f64 - 1.0) * lh / 2.0;
-                for (i, line) in lines.iter().enumerate() {
-                    self.draw_centered(cr, line, rx + rw / 2.0, top + i as f64 * lh, fs, label);
-                }
-            }
-        }
-        if vis == ModKeyState::Locked {
-            set_src(cr, 0xffffff);
-            cr.arc(rx + rw - 0.23 * k, ry + 0.23 * k, 0.08 * k, 0.0, 2.0 * std::f64::consts::PI);
-            let _ = cr.fill();
-        }
-        let _ = cr.restore();
     }
 }
 
-/// The keyboard state, shared with the window procedure through a raw
-/// pointer (the Win32 callback has no way to carry user data here).
+/// The window procedure reaches the state through this pointer; it is
+/// set while [`run`] owns the state and the window exists.
 static mut STATE_PTR: *mut State = std::ptr::null_mut();
 
-/// Window procedure. `WM_MOUSEACTIVATE` returns `MA_NOACTIVATE` (3) so the
-/// OSK never takes keyboard focus from the active window.
-unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, _wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if STATE_PTR.is_null() {
-        return DefWindowProcW(hwnd, msg, _wparam, lparam);
+fn lparam_xy(lparam: LPARAM) -> (i32, i32) {
+    (
+        (lparam.0 & 0xffff) as i16 as i32,
+        ((lparam.0 >> 16) & 0xffff) as i16 as i32,
+    )
+}
+
+unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let ptr = unsafe { STATE_PTR };
+    if ptr.is_null() {
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     }
-    let state = &mut *STATE_PTR;
-    match msg {
-        WM_MOUSEACTIVATE => LRESULT(3),
+    let state = unsafe { &mut *ptr };
+    let result = match msg {
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE),
         WM_ERASEBKGND => LRESULT(1),
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
-            BeginPaint(hwnd, &mut ps);
-            state.render();
-            let _ = EndPaint(hwnd, &ps);
+            let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
+            state.paint_to(hdc.0);
+            let _ = unsafe { EndPaint(hwnd, &ps) };
             LRESULT(0)
         }
         WM_TIMER => {
-            state.handle_repeat();
-            state.handle_flash();
-            state.handle_hold();
-            state.handle_dictation();
-            state.backend.pump();
-            if state.quit {
-                let _ = DestroyWindow(hwnd);
-            }
+            state.tick();
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
-            let x = (lparam.0 & 0xffff) as i16 as i32;
-            let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+            let (x, y) = lparam_xy(lparam);
             let was_inside = state.inside;
             state.px = x;
             state.py = y;
@@ -2688,95 +1047,69 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, _wparam: WPARAM, lparam
             LRESULT(0)
         }
         WM_MOUSELEAVE => {
-            state.inside = false;
-            if state.pressed >= 0 {
-                state.flash_key = state.pressed;
-                state.flash_until = now_ms() + FLASH_MS;
-                state.pressed = -1;
-            }
-            state.rep_key = -1;
-            state.request_redraw();
+            state.on_leave();
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
-            SetCapture(hwnd);
-            let x = (lparam.0 & 0xffff) as i16 as i32;
-            let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
-            state.px = x;
-            state.py = y;
+            unsafe { SetCapture(hwnd) };
+            (state.px, state.py) = lparam_xy(lparam);
             state.inside = true;
             state.on_button(true);
-            if state.quit {
-                let _ = DestroyWindow(hwnd);
-            }
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            let _ = ReleaseCapture();
-            let x = (lparam.0 & 0xffff) as i16 as i32;
-            let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
-            state.px = x;
-            state.py = y;
+            let _ = unsafe { ReleaseCapture() };
+            (state.px, state.py) = lparam_xy(lparam);
             state.on_button(false);
             LRESULT(0)
         }
         WM_RBUTTONDOWN => {
-            let x = (lparam.0 & 0xffff) as i16 as i32;
-            let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
-            state.px = x;
-            state.py = y;
+            (state.px, state.py) = lparam_xy(lparam);
             state.on_right_click();
             LRESULT(0)
         }
         WM_SIZE => {
-            let w = lparam.0 as u16 as i32;
-            let h = (lparam.0 >> 16) as u16 as i32;
-            if w != state.width || h != state.height {
+            let w = (lparam.0 & 0xffff) as i32;
+            let h = ((lparam.0 >> 16) & 0xffff) as i32;
+            if w > 0 && h > 0 && (w != state.width || h != state.height) {
                 state.width = w;
                 state.height = h;
-                state.dirty = true;
-                state.request_redraw();
             }
-            LRESULT(0)
-        }
-        WM_DESTROY => {
-            state.quit = true;
-            PostQuitMessage(0);
+            state.request_redraw();
             LRESULT(0)
         }
         WM_SETCURSOR => {
-            unsafe {
-                if let Ok(c) = LoadCursorW(None, IDC_ARROW) {
-                    SetCursor(Some(c));
-                    return LRESULT(1);
-                }
+            // The resize corner shows the diagonal resize cursor.
+            let shape = if state.view().handle_hov() { IDC_SIZENWSE } else { IDC_ARROW };
+            if let Ok(c) = unsafe { LoadCursorW(None, shape) } {
+                unsafe { SetCursor(Some(c)) };
             }
-            DefWindowProcW(hwnd, msg, _wparam, lparam)
+            LRESULT(1)
         }
-        _ => DefWindowProcW(hwnd, msg, _wparam, lparam),
+        WM_DESTROY => {
+            state.quit = true;
+            unsafe { PostQuitMessage(0) };
+            LRESULT(0)
+        }
+        _ => return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    };
+    if state.quit && msg != WM_DESTROY {
+        let _ = unsafe { DestroyWindow(hwnd) };
+    } else {
+        state.arm_timer();
     }
+    result
 }
 
-/// The Win32 UI. Runs until the keyboard is closed or the window is
-/// destroyed.
-pub fn run(backend: Box<dyn Backend>) -> i32 {
-    let mut state = Box::new(State::new(backend));
-
-    // Default size: 1u = U0 pixels (if no valid saved size).
-    let rows = state.layout().rows.len() as f64;
-    if state.width < MIN_W {
-        state.width = ((state.grid_cols as f64 / 20.0 + 2.0 * MARGIN_U) * U0 + 0.5) as i32;
-    }
-    if state.height < MIN_H {
-        state.height = ((BAR_U + rows + 2.0 * MARGIN_U) * U0 + 0.5) as i32;
-    }
-
+/// The Win32 UI. Runs until the keyboard is closed.
+pub fn run(backend: Box<dyn Backend>, neural: Option<NeuralEngine>) -> i32 {
+    let mut state = Box::new(State::new(backend, neural));
     let class_name: Vec<u16> = "osk-win-window\0".encode_utf16().collect();
     let title: Vec<u16> = "OSK\0".encode_utf16().collect();
     let hinst = match unsafe { GetModuleHandleW(None) } {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("osk: GetModuleHandleW failed: {e}");
+            warn!("osk: GetModuleHandleW failed: {e}");
             return 1;
         }
     };
@@ -2789,21 +1122,11 @@ pub fn run(backend: Box<dyn Backend>) -> i32 {
         lpszClassName: PCWSTR::from_raw(class_name.as_ptr()),
         ..Default::default()
     };
-    let atom = unsafe { RegisterClassExW(&wc) };
-    if atom == 0 {
-        eprintln!("osk: RegisterClassExW failed");
+    if unsafe { RegisterClassExW(&wc) } == 0 {
+        warn!("osk: RegisterClassExW failed");
         return 1;
     }
-    let rows = state.layout().rows.len() as f64;
-    if state.width < MIN_W {
-        state.width = ((state.grid_cols as f64 / 20.0 + 2.0 * MARGIN_U) * U0 + 0.5) as i32;
-    }
-    if state.height < MIN_H {
-        state.height = ((BAR_U + rows + 2.0 * MARGIN_U) * U0 + 0.5) as i32;
-    }
-    unsafe {
-        STATE_PTR = &mut *state as *mut State;
-    }
+    unsafe { STATE_PTR = &mut *state as *mut State };
     let hwnd = match unsafe {
         CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
@@ -2822,15 +1145,15 @@ pub fn run(backend: Box<dyn Backend>) -> i32 {
     } {
         Ok(h) => h,
         Err(e) => {
-            unsafe { STATE_PTR = std::ptr::null_mut(); }
-            eprintln!("osk: CreateWindowExW failed: {e}");
+            unsafe { STATE_PTR = std::ptr::null_mut() };
+            warn!("osk: CreateWindowExW failed: {e}");
             return 1;
         }
     };
     state.hwnd = hwnd.0 as isize;
+    state.last_geom = (state.pos_x, state.pos_y, state.width, state.height);
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        SetTimer(Some(hwnd), 1, 16, None);
     }
     let mut msg = MSG::default();
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
@@ -2838,16 +1161,10 @@ pub fn run(backend: Box<dyn Backend>) -> i32 {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        if state.quit {
-            break;
-        }
     }
-    unsafe {
-        let _ = KillTimer(Some(hwnd), 1);
-        let _ = DestroyWindow(hwnd);
-        STATE_PTR = std::ptr::null_mut();
-    }
+    unsafe { STATE_PTR = std::ptr::null_mut() };
     state.save_config();
+    state.save_history();
     state.backend.destroy();
     0
 }
@@ -2855,14 +1172,96 @@ pub fn run(backend: Box<dyn Backend>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use osk_core::key::key;
+    use osk_core::mods::{ModKeyState, MOD_ALT, MOD_META};
+
+    struct MockBackend;
+
+    impl Backend for MockBackend {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+        fn init(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn press(&mut self, _code: u16) {}
+        fn release(&mut self, _code: u16) {}
+        fn pump(&mut self) {}
+        fn destroy(&mut self) {}
+    }
+
+    fn state() -> State {
+        let mut s = State::new(Box::new(MockBackend), None);
+        s.width = 800;
+        s.height = 300;
+        s
+    }
+
+    /// Point the pointer at the center of the key with code `code`.
+    fn point_at(s: &mut State, code: u16) -> usize {
+        let layout = s.layout();
+        let idx = layout
+            .rows
+            .iter()
+            .enumerate()
+            .find_map(|(r, row)| {
+                row.keys.iter().position(|k| k.code_u16() == code).map(|i| r * 100 + i)
+            })
+            .expect("key in the layout");
+        let (x, y, w, h) = s.view().key_rect(idx / 100, idx % 100);
+        s.px = (x + w / 2.0) as i32;
+        s.py = (y + h / 2.0) as i32;
+        s.inside = true;
+        idx
+    }
 
     #[test]
-    fn test_persistent_config_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("osk-test-config-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("config.json");
+    fn win_and_alt_are_momentary_taps_not_latches() {
+        for (code, slot) in [(key::KEY_LEFTMETA, MOD_META), (key::KEY_LEFTALT, MOD_ALT)] {
+            let mut s = state();
+            let idx = point_at(&mut s, code);
+            s.on_button(true);
+            assert_eq!(s.ctl.mods().state(slot), ModKeyState::Off, "code {code} must not latch");
+            assert!(matches!(s.interaction, Interaction::Press { key, .. } if key == idx));
+            s.on_button(false);
+            assert_eq!(s.flash_key, idx as i32);
+            assert_eq!(s.interaction, Interaction::Idle);
+        }
+    }
 
+    #[test]
+    fn a_drag_and_a_resize_follow_the_pointer_in_screen_coordinates() {
+        let mut s = state();
+        (s.pos_x, s.pos_y) = (100, 100);
+        s.drag_origin = (100, 100);
+        s.interaction = Interaction::Move {
+            grab_x: 150,
+            grab_y: 120,
+            fx: 0.0,
+            fy: 0.0,
+        };
+        s.drag_to((180, 140));
+        assert_eq!((s.pos_x, s.pos_y), (130, 120));
+
+        s.interaction = Interaction::Resize {
+            grab_x: 750,
+            grab_y: 420,
+            w: 600,
+            h: 300,
+        };
+        s.drag_to((780, 440));
+        let (w, h) = Metrics::clamp_size(630, 320, s.grid_cols, s.layout().rows.len());
+        assert_eq!((s.width, s.height), (w.max(MIN_W), h.max(MIN_H)));
+    }
+
+    #[test]
+    fn nothing_is_due_at_rest() {
+        let s = state();
+        assert_eq!(s.next_wake(), None);
+    }
+
+    #[test]
+    fn persistent_config_round_trips() {
         let cfg = PersistentConfig {
             pos_x: 250,
             pos_y: 350,
@@ -2873,211 +1272,10 @@ mod tests {
             tab_accepts_prediction: true,
             prediction: false,
         };
-
         let json = serde_json::to_string_pretty(&cfg).unwrap();
-        std::fs::write(&path, json).unwrap();
-
-        let loaded: PersistentConfig = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(loaded.pos_x, 250);
-        assert_eq!(loaded.pos_y, 350);
-        assert_eq!(loaded.width, 750);
-        assert_eq!(loaded.height, 280);
-        assert_eq!(loaded.theme, "Nord");
-        assert_eq!(loaded.layout, "65%+Num");
-        assert!(loaded.tab_accepts_prediction);
-        assert!(!loaded.prediction);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_config_path_resolution() {
-        let test_val = "Z:/tmp/test_osk_cfg.json";
-        unsafe {
-            std::env::set_var("OSK_CONFIG", test_val);
-        }
-        let p = config_path();
-        assert_eq!(p, Some(PathBuf::from(test_val)));
-        unsafe {
-            std::env::remove_var("OSK_CONFIG");
-        }
-    }
-
-    struct MockBackend {
-        events: Vec<(u16, bool)>,
-    }
-
-    impl Backend for MockBackend {
-        fn name(&self) -> &'static str {
-            "mock"
-        }
-        fn init(&mut self) -> Result<(), String> {
-            Ok(())
-        }
-        fn press(&mut self, code: u16) {
-            self.events.push((code, true));
-        }
-        fn release(&mut self, code: u16) {
-            self.events.push((code, false));
-        }
-        fn pump(&mut self) {}
-        fn destroy(&mut self) {}
-    }
-
-    #[test]
-    fn test_win_key_momentary_tap() {
-        let backend = Box::new(MockBackend { events: Vec::new() });
-        let mut state = State::new(backend);
-        state.width = 800;
-        state.height = 300;
-
-        // Locate the Win / Super key in the 65% layout
-        let mut win_idx = None;
-        for (r, row) in state.layout().rows.iter().enumerate() {
-            for (k, key) in row.keys.iter().enumerate() {
-                if key.code == key::KEY_LEFTMETA {
-                    win_idx = Some(r * 100 + k);
-                    break;
-                }
-            }
-        }
-        let win_k = win_idx.expect("Win key should exist in 65% layout");
-
-        // Simulate click on the Win key
-        let (bx, by, bw, bh) = state.key_rect(win_k / 100, win_k % 100);
-        state.px = (bx + bw / 2.0) as i32;
-        state.py = (by + bh / 2.0) as i32;
-        state.on_button(true);
-
-        // Win key must inject press + release immediately (not latch)
-        assert_eq!(state.mods.state(MOD_META), ModKeyState::Off, "Win key should not latch modifier state");
-        assert_eq!(state.pressed, win_k as i32);
-
-        // Release button
-        state.on_button(false);
-        assert_eq!(state.flash_key, win_k as i32);
-        assert_eq!(state.pressed, -1);
-    }
-
-    #[test]
-    fn test_drag_and_resize_geometry() {
-        let backend = Box::new(MockBackend { events: Vec::new() });
-        let mut state = State::new(backend);
-        state.pos_x = 100;
-        state.pos_y = 100;
-        state.width = 600;
-        state.height = 300;
-
-        // Simulate moving: start drag at screen (150, 120)
-        state.moving = true;
-        state.shown_x = 100;
-        state.shown_y = 100;
-        state.grab_sx = 150;
-        state.grab_sy = 120;
-
-        // Moving cursor to screen (180, 140) produces delta (+30, +20)
-        let pt = POINT { x: 180, y: 140 };
-        let nx = state.shown_x + (pt.x - state.grab_sx);
-        let ny = state.shown_y + (pt.y - state.grab_sy);
-        assert_eq!(nx, 130);
-        assert_eq!(ny, 120);
-
-        // Simulate resizing: start resize at screen (750, 420)
-        state.resizing = true;
-        state.rsz_w = 600;
-        state.rsz_h = 300;
-        state.grab_sx = 750;
-        state.grab_sy = 420;
-
-        // Moving cursor to screen (800, 450) produces delta (+50, +30)
-        let pt2 = POINT { x: 800, y: 450 };
-        let w = (state.rsz_w + (pt2.x - state.grab_sx)).max(MIN_W);
-        let h = (state.rsz_h + (pt2.y - state.grab_sy)).max(MIN_H);
-        assert_eq!(w, 650);
-        assert_eq!(h, 330);
-    }
-
-    #[test]
-    fn test_alt_key_momentary_tap() {
-        let backend = Box::new(MockBackend { events: Vec::new() });
-        let mut state = State::new(backend);
-        state.width = 800;
-        state.height = 300;
-
-        // Locate Alt key in 65% layout
-        let mut alt_idx = None;
-        for (r, row) in state.layout().rows.iter().enumerate() {
-            for (k, key) in row.keys.iter().enumerate() {
-                if key.code == key::KEY_LEFTALT {
-                    alt_idx = Some(r * 100 + k);
-                    break;
-                }
-            }
-        }
-        let alt_k = alt_idx.expect("Alt key should exist in 65% layout");
-
-        // Simulate click on Alt key
-        let (bx, by, bw, bh) = state.key_rect(alt_k / 100, alt_k % 100);
-        state.px = (bx + bw / 2.0) as i32;
-        state.py = (by + bh / 2.0) as i32;
-        state.on_button(true);
-
-        // Alt key must inject press + release immediately (not latch)
-        assert_eq!(state.mods.state(MOD_ALT), ModKeyState::Off, "Alt key should not latch modifier state");
-        assert_eq!(state.pressed, alt_k as i32);
-
-        // Release button
-        state.on_button(false);
-        assert_eq!(state.flash_key, alt_k as i32);
-        assert_eq!(state.pressed, -1);
-    }
-
-    #[test]
-    fn test_prediction_toggle_and_clear() {
-        let dir = std::env::temp_dir().join(format!("osk-test-pred-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("config.json");
-        unsafe {
-            std::env::set_var("OSK_CONFIG", &path);
-        }
-        let backend = Box::new(MockBackend { events: Vec::new() });
-        let mut state = State::new(backend);
-        assert!(state.prediction);
-
-        // Feed some letters into predictor
-        state.predictor.char('h');
-        state.predictor.char('e');
-        state.predictor.char('l');
-        assert!(!state.predictor.suggestions().is_empty());
-
-        // Toggle prediction off
-        state.theme_menu_open = true;
-        state.pred_toggle_rect = Rect { x: 10.0, y: 10.0, w: 100.0, h: 30.0, idx: 0 };
-        state.px = 20;
-        state.py = 20;
-        state.on_button(true);
-
-        assert!(!state.prediction, "Prediction should toggle to false");
-        assert_eq!(state.predictor.partial(), "", "Partial buffer should be cleared on toggle off");
-        let mut canvas = Canvas::new_bitmap(800, 300).unwrap();
-        let bar = state.measure_bar(&mut canvas);
-        assert_eq!(bar.n_sugg, 0, "No suggestions should be shown when prediction is toggled off");
-
-        // Clear active and learned words
-        state.predictor.learn_word("customword", 1);
-        assert!(!state.predictor.learned_words().is_empty());
-
-        state.dict_menu_open = true;
-        state.dict_clear_rect = Rect { x: 10.0, y: 50.0, w: 100.0, h: 30.0, idx: 0 };
-        state.px = 20;
-        state.py = 60;
-        state.on_button(true);
-
-        assert!(state.predictor.learned_words().is_empty(), "Learned words should be wiped on clear");
-        unsafe {
-            std::env::remove_var("OSK_CONFIG");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
+        let loaded: PersistentConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!((loaded.pos_x, loaded.pos_y, loaded.width, loaded.height), (250, 350, 750, 280));
+        assert_eq!((loaded.theme.as_str(), loaded.layout.as_str()), ("Nord", "65%+Num"));
+        assert!(loaded.tab_accepts_prediction && !loaded.prediction);
     }
 }
-

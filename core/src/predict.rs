@@ -11,14 +11,18 @@
 //! 3. Multi-tier context interpolation: trigram -> bigram -> unigram backoff with rank decay.
 //! 4. Context-aware prefix completion: contextual followers are prioritized over generic lexicon.
 //! 5. Brevity weighting, exact-match bonus, and a stem penalty that diversifies the pills.
-//! 6. Disk persistence of the user history (TSV under the XDG data home).
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+//! 6. Learned-history serialization as text with a dirty flag; the host
+//!    (osk-backend) resolves the path and does the file I/O.
+//! 7. Spelling correction: misspelled partials get close words from
+//!    [`crate::spell`], ranked against the completions.
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use parking_lot::RwLock;
 
 use crate::ngm::{model, EMPTY};
+use crate::spell;
 use crate::words::WORDS;
 
 /// Maximum suggestions shown.
@@ -31,6 +35,12 @@ const MAX_USER_BIGRAMS: usize = 2048;
 const MAX_USER_WORDS: usize = 1024;
 /// Common openers offered at a sentence start or with no context.
 const SENTENCE_STARTERS: &[&str] = &["i", "the", "we", "how", "what", "yes", "thanks"];
+/// Score lost per tenth of an edit between the typed letters and a
+/// spelling correction.
+const CORRECTION_PENALTY: i32 = 100;
+/// Bonus for a correction that spans the whole word, mirroring the
+/// exact-match bonus of a completion.
+const WHOLE_CORRECTION_BONUS: i32 = 300;
 /// Maximum length of the running sentence context sent to the neural
 /// engine (the tail of the sentence is kept).
 const MAX_CONTEXT: usize = 2048;
@@ -47,12 +57,12 @@ static INTERNED: LazyLock<RwLock<HashSet<&'static str>>> =
 pub fn intern(s: &str) -> &'static str {
     let set = INTERNED.read();
     if let Some(w) = set.iter().find(|w| **w == s) {
-        return *w;
+        return w;
     }
     drop(set);
     let mut set = INTERNED.write();
     if let Some(w) = set.iter().find(|w| **w == s) {
-        return *w;
+        return w;
     }
     let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
     set.insert(leaked);
@@ -68,42 +78,88 @@ pub struct LearnedWord {
     pub links: usize,
 }
 
+/// The word being typed, kept twice on purpose: `lower` (all
+/// lowercase, for matching, completion and context) and `typed`
+/// (exactly as typed, for retyping a spelling correction). Every
+/// operation updates both, so the pair cannot drift apart.
+#[derive(Clone, Debug, Default)]
+struct Partial {
+    lower: String,
+    typed: String,
+}
+
+impl Partial {
+    fn is_empty(&self) -> bool {
+        self.lower.is_empty()
+    }
+
+    /// Length of the lowercased form (the typed form never differs
+    /// except in case, so this bounds both).
+    fn len(&self) -> usize {
+        self.lower.len()
+    }
+
+    fn last_char(&self) -> Option<char> {
+        self.lower.chars().next_back()
+    }
+
+    fn clear(&mut self) {
+        self.lower.clear();
+        self.typed.clear();
+    }
+
+    /// Type one character: `lower` gets the lowercase form, `typed`
+    /// keeps the case it was typed in.
+    fn push(&mut self, c: char) {
+        self.lower.push(c.to_ascii_lowercase());
+        self.typed.push(c);
+    }
+
+    fn pop(&mut self) {
+        self.lower.pop();
+        self.typed.pop();
+    }
+
+    /// Take the lowercased word to hand to the context; both forms end
+    /// up empty, as [`Partial::clear`] leaves them.
+    fn take_lower(&mut self) -> String {
+        let lower = std::mem::take(&mut self.lower);
+        self.typed.clear();
+        lower
+    }
+}
+
+/// The last two committed words: `prev` was typed before `last`, and
+/// together they are the trigram/bigram context. Several paths (space
+/// on a bare word, `.`/`!`/`?`, Enter, forget) clear both at once.
+#[derive(Clone, Debug, Default)]
+struct WordContext {
+    prev: String,
+    last: String,
+}
+
+impl WordContext {
+    /// `last` falls back to `prev` and `word` becomes the new last.
+    fn shift(&mut self, word: &str) {
+        self.prev = std::mem::take(&mut self.last);
+        self.last = word.to_string();
+    }
+
+    fn clear(&mut self) {
+        self.prev.clear();
+        self.last.clear();
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct UserHistory {
     /// (prev_word, next_word, count)
     bigrams: Vec<(&'static str, &'static str, u16)>,
     /// (word, count)
     unigrams: Vec<(&'static str, u16)>,
-    /// Where this history persists; `None` = ephemeral.
-    path: Option<PathBuf>,
 }
 
 impl UserHistory {
-    /// `$XDG_DATA_HOME/osk/user_history.tsv`, else
-    /// `~/.local/share/osk/user_history.tsv`.
-    fn default_path() -> PathBuf {
-        if let Some(appdata) = std::env::var_os("APPDATA").or_else(|| std::env::var_os("LOCALAPPDATA")) {
-            let p = PathBuf::from(appdata);
-            if p.is_absolute() {
-                return p.join("osk").join("user_history.tsv");
-            }
-        }
-        if let Some(profile) = std::env::var_os("USERPROFILE") {
-            let p = PathBuf::from(profile);
-            if p.is_absolute() {
-                return p.join("AppData").join("Roaming").join("osk").join("user_history.tsv");
-            }
-        }
-        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
-            let p = PathBuf::from(xdg);
-            if p.is_absolute() {
-                return p.join("osk").join("user_history.tsv");
-            }
-        }
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-        home.join(".local/share/osk/user_history.tsv")
-    }
-
     fn record(&mut self, prev: Option<&'static str>, word: &'static str) {
         self.add_unigram(word, 1);
         if let Some(p) = prev {
@@ -180,7 +236,7 @@ impl UserHistory {
                     .filter(|(a, b, _)| *a == *w || *b == *w)
                     .count();
                 LearnedWord {
-                    word: *w,
+                    word: w,
                     count: *c,
                     links,
                 }
@@ -215,12 +271,9 @@ impl UserHistory {
         self.bigrams.clear();
     }
 
-    /// Write the history as TSV lines:
+    /// The history as TSV lines:
     /// `u \t word \t <empty> \t count` and `b \t prev \t next \t count`.
-    fn save_to(&self, path: &Path) {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
+    fn tsv(&self) -> String {
         let mut out = String::new();
         for (w, c) in &self.unigrams {
             out.push('u');
@@ -241,20 +294,12 @@ impl UserHistory {
             out.push_str(&c.to_string());
             out.push('\n');
         }
-        let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, &out).is_ok() {
-            if std::fs::rename(&tmp, path).is_err() {
-                let _ = std::fs::write(path, out);
-                let _ = std::fs::remove_file(&tmp);
-            }
-        }
+        out
     }
 
-    /// Merge the history stored at `path` into this one.
-    fn load_from(&mut self, path: &Path) {
-        let Ok(data) = std::fs::read_to_string(path) else {
-            return;
-        };
+    /// Merge the history serialized by [`UserHistory::tsv`] into this
+    /// one. Malformed lines are skipped.
+    fn load_tsv(&mut self, data: &str) {
         for line in data.lines() {
             let mut f = line.split('\t');
             let (kind, w1, w2, count) = match (f.next(), f.next(), f.next(), f.next()) {
@@ -274,19 +319,6 @@ impl UserHistory {
                 _ => continue,
             }
         }
-    }
-
-    fn save_to_disk(&self) {
-        if let Some(p) = &self.path {
-            self.save_to(p);
-        }
-    }
-
-    fn load_from_disk(&mut self) {
-        let Some(p) = self.path.clone() else {
-            return;
-        };
-        self.load_from(&p);
     }
 }
 
@@ -314,16 +346,52 @@ fn find_or_intern(word: &str) -> &'static str {
 
 #[derive(Clone, Debug, Default)]
 pub struct Predictor {
-    partial: String,
-    last_word: String,
-    prev_word: String,
+    partial: Partial,
+    words: WordContext,
     /// True right after `.`/`!`/`?`; the next word gets the sentence-start blend.
     at_sentence_start: bool,
     user_history: UserHistory,
+    /// True when a mutation changed the learned history and the host
+    /// has not saved it yet (`take_history_dirty`).
+    history_dirty: bool,
+    /// Bumped by every mutation so the spell cache can tell that the
+    /// corrections it holds were computed for a stale state.
+    revision: u64,
     /// Running sentence text sent to the neural engine on each commit.
     sentence_context: String,
-    /// Optional explicitly attached neural engine. When absent, falls back to the process-wide engine.
-    neural_engine: Option<std::sync::Arc<crate::neural::NeuralEngine>>,
+    /// Spelling corrections for the last revision seen, since
+    /// `suggestions()` runs several times per keystroke.
+    spell_cache: RefCell<Option<(u64, Vec<spell::Correction>)>>,
+}
+
+/// Completion score boost for the word at `rank` in the neural
+/// ranking's prefix matches.
+fn neural_boost(rank: usize) -> i32 {
+    (4000 - 600 * rank as i32).max(800)
+}
+
+/// A sentence context as a neural prompt; None when it is empty.
+fn prompt_of(ctx: &str) -> Option<String> {
+    let prompt = ctx.trim_end();
+    (!prompt.is_empty()).then(|| prompt.to_string())
+}
+
+/// Rank of each lexicon word, most frequent first.
+static WORD_RANK: LazyLock<HashMap<&'static str, usize>> =
+    LazyLock::new(|| WORDS.iter().enumerate().map(|(i, w)| (*w, i)).collect());
+
+/// Global frequency prior: the lexicon rank, or the model rank on a
+/// log scale for words only the model knows; the better of the two.
+fn frequency_prior(w: &str) -> i32 {
+    let lexicon = WORD_RANK
+        .get(w)
+        .map_or(0, |&rank| (WORDS.len() as i32 - rank as i32) / 4);
+    let m = model();
+    let vocab = m.len().max(1) as f32;
+    let ngram = m.id_of(w).map_or(0, |id| {
+        (1000.0 * (1.0 - (id as f32 + 1.0).ln() / (vocab + 1.0).ln())) as i32
+    });
+    lexicon.max(ngram)
 }
 
 fn push_sugg(row: &mut Vec<&'static str>, s: &'static str) {
@@ -378,39 +446,41 @@ fn clean_word(word: &str) -> String {
 }
 
 impl Predictor {
-    /// A predictor whose history persists to the standard location
-    /// (`$XDG_DATA_HOME/osk/user_history.tsv` or
-    /// `~/.local/share/osk/user_history.tsv`), loaded on construction.
+    /// A fresh predictor with no learned history. The host loads the
+    /// history ([`Predictor::load_history_tsv`], e.g. via
+    /// `osk_backend::load_history`) and saves it when it goes dirty.
     pub fn new() -> Self {
-        let mut p = Self::default();
-        p.user_history.path = Some(UserHistory::default_path());
-        p.user_history.load_from_disk();
-        p
+        Self::default()
     }
 
-    /// A predictor with no disk persistence.
+    /// A predictor never meant to be persisted (tests, one-shot jobs).
     pub fn ephemeral() -> Self {
         Self::default()
     }
 
-    /// Persist the learned history to the standard location.
-    pub fn save_to_disk(&self) {
-        self.user_history.save_to_disk();
+    /// True when a mutation changed the learned history since the last
+    /// take; taking leaves the flag clear.
+    pub fn take_history_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.history_dirty)
     }
 
-    /// Merge the history from the standard location into this predictor.
-    pub fn load_from_disk(&mut self) {
-        self.user_history.load_from_disk();
+    /// Flag the learned history unsaved again, after a host's write
+    /// failed, so the next save retries it.
+    pub fn mark_history_dirty(&mut self) {
+        self.history_dirty = true;
     }
 
-    /// Persist the learned history to `path` (parent dirs created).
-    pub fn save_history_to(&self, path: &Path) {
-        self.user_history.save_to(path);
+    /// The learned history serialized as TSV text, for the host to
+    /// write wherever it sees fit.
+    pub fn history_tsv(&self) -> String {
+        self.user_history.tsv()
     }
 
-    /// Merge the history stored at `path` into this predictor.
-    pub fn load_history_from(&mut self, path: &Path) {
-        self.user_history.load_from(path);
+    /// Merge host-loaded TSV history into this predictor. Loading is
+    /// not a user mutation: it does not flag the history dirty.
+    pub fn load_history_tsv(&mut self, data: &str) {
+        self.revision += 1;
+        self.user_history.load_tsv(data);
     }
 
     /// The learned words with their commit counts and bigram link
@@ -426,7 +496,7 @@ impl Predictor {
 
     /// Forget `word` and every bigram that touches it; true if
     /// anything was removed. The running word context is cleared of
-    /// it and the history is persisted.
+    /// it and the history is flagged for saving.
     pub fn forget_word(&mut self, word: &str) -> bool {
         let clean = clean_word(word);
         if clean.is_empty() {
@@ -434,56 +504,70 @@ impl Predictor {
         }
         let removed = self.user_history.forget(&clean);
         if removed {
-            if self.last_word == clean {
-                self.last_word.clear();
+            self.revision += 1;
+            self.history_dirty = true;
+            if self.words.last == clean {
+                self.words.last.clear();
             }
-            if self.prev_word == clean {
-                self.prev_word.clear();
+            if self.words.prev == clean {
+                self.words.prev.clear();
             }
         }
-        self.user_history.save_to_disk();
         removed
     }
 
     /// Teach `word` with `count` commits (at least one); false when
-    /// the word fails validation. The history is persisted.
+    /// the word fails validation. The history is flagged for saving.
     pub fn learn_word(&mut self, word: &str, count: u16) -> bool {
         let clean = clean_word(word);
         if !is_valid_word(&clean) {
             return false;
         }
+        self.revision += 1;
         let w_static = find_or_intern(&clean);
         self.user_history.learn(w_static, count.max(1));
-        self.user_history.save_to_disk();
+        self.history_dirty = true;
         true
     }
 
     /// Drop all learned words and bigrams and the running word context.
     pub fn clear_learned(&mut self) {
         self.user_history.clear();
-        self.user_history.save_to_disk();
-        self.last_word.clear();
-        self.prev_word.clear();
+        self.words.clear();
+        self.revision += 1;
+        self.history_dirty = true;
     }
 
     /// Reset to a clean state (no partial, no context).
     pub fn reset(&mut self) {
-        self.partial.clear();
-        self.last_word.clear();
-        self.prev_word.clear();
+        self.clear_partial();
+        self.words.clear();
         self.at_sentence_start = false;
         self.sentence_context.clear();
+        self.revision += 1;
+    }
+
+    /// Enter or send: the sentence being typed is over. Clears the
+    /// partial, the word context, and the sentence context, and marks
+    /// the next word as a sentence start so the pills offer fresh
+    /// openers.
+    pub fn end_message(&mut self) {
+        self.clear_partial();
+        self.words.clear();
+        self.sentence_context.clear();
+        self.at_sentence_start = true;
+        self.revision += 1;
     }
 
     /// A key was typed. Letters extend the partial word; `'` extends it
     /// when the previous character is a letter (contractions); any other
     /// non-letter ends the word, and `.`/`!`/`?` mark a sentence start.
     pub fn char(&mut self, c: char) {
+        self.revision += 1;
         if c == '\'' {
             let last_alpha = self
                 .partial
-                .chars()
-                .next_back()
+                .last_char()
                 .is_some_and(|l| l.is_ascii_alphabetic());
             if self.partial.is_empty()
                 || !last_alpha
@@ -506,130 +590,143 @@ impl Predictor {
         if self.partial.len() >= WORD_LEN {
             return;
         }
-        self.partial.push(c.to_ascii_lowercase());
+        self.partial.push(c);
     }
 
     /// Backspace: drop the last letter of the partial.
     pub fn backspace(&mut self) {
         self.partial.pop();
+        self.revision += 1;
+    }
+
+    fn clear_partial(&mut self) {
+        self.partial.clear();
     }
 
     /// Space: the partial becomes the context; a bare space drops it.
     pub fn space(&mut self) {
+        self.revision += 1;
         if !self.partial.is_empty() {
-            let cur = std::mem::take(&mut self.partial);
-            let prev = (!self.last_word.is_empty()).then(|| self.last_word.clone());
-            self.prev_word = std::mem::take(&mut self.last_word);
-            self.last_word = cur.clone();
+            let cur = self.partial.take_lower();
+            let prev = (!self.words.last.is_empty()).then(|| self.words.last.clone());
+            self.words.shift(&cur);
             let w_static = find_or_intern(&cur);
             let p_static = prev.as_deref().map(find_or_intern);
             self.user_history.record(p_static, w_static);
-            self.user_history.save_to_disk();
+            self.history_dirty = true;
             self.at_sentence_start = false;
             self.append_word(&cur);
-            self.request_neural();
         } else {
-            self.last_word.clear();
-            self.prev_word.clear();
+            self.words.clear();
         }
     }
 
     /// Cursor move or punctuation: drop partial and context.
     pub fn break_word(&mut self) {
-        self.partial.clear();
-        self.last_word.clear();
-        self.prev_word.clear();
+        self.clear_partial();
+        self.words.clear();
+        self.revision += 1;
     }
 
     /// A suggestion was accepted: its leading letter/apostrophe run
     /// (lowercased) becomes the context. Empty words clear the context.
     pub fn commit(&mut self, word: &str) {
-        self.partial.clear();
-        let clean: String = word
-            .chars()
-            .take_while(|c| c.is_ascii_alphabetic() || *c == '\'')
-            .take(WORD_LEN)
-            .map(|c| c.to_ascii_lowercase())
-            .collect();
+        self.revision += 1;
+        self.clear_partial();
+        let clean = clean_word(word);
         if clean.is_empty() {
-            self.last_word.clear();
-            self.prev_word.clear();
+            self.words.clear();
         } else {
-            let prev = (!self.last_word.is_empty()).then(|| self.last_word.clone());
-            self.prev_word = std::mem::take(&mut self.last_word);
-            self.last_word = clean.clone();
+            let prev = (!self.words.last.is_empty()).then(|| self.words.last.clone());
+            self.words.shift(&clean);
             let w_static = find_or_intern(&clean);
             let p_static = prev.as_deref().map(find_or_intern);
             self.user_history.record(p_static, w_static);
-            self.user_history.save_to_disk();
+            self.history_dirty = true;
             self.at_sentence_start = false;
             self.append_word(&clean);
-            self.request_neural();
         }
     }
 
-    /// Append a committed word to the running sentence context,
-    /// keeping only the tail beyond [`MAX_CONTEXT`].
+    /// Append a committed word to the running sentence context.
     fn append_word(&mut self, word: &str) {
+        self.sentence_context = self.context_after(word);
+    }
+
+    /// The running sentence context with `word` committed, keeping only
+    /// the tail beyond [`MAX_CONTEXT`].
+    fn context_after(&self, word: &str) -> String {
+        let mut ctx = self.sentence_context.clone();
         if word.is_empty() {
-            return;
+            return ctx;
         }
-        self.sentence_context.push_str(word);
-        self.sentence_context.push(' ');
-        if self.sentence_context.len() > MAX_CONTEXT {
-            let cut = self.sentence_context.len() - MAX_CONTEXT;
-            let cut = self.sentence_context.floor_char_boundary(cut);
-            self.sentence_context.drain(..cut);
+        ctx.push_str(word);
+        ctx.push(' ');
+        if ctx.len() > MAX_CONTEXT {
+            let cut = ctx.floor_char_boundary(ctx.len() - MAX_CONTEXT);
+            ctx.drain(..cut);
         }
+        ctx
     }
 
-    /// Attach a neural engine directly to this predictor.
-    pub fn with_neural_engine(mut self, engine: std::sync::Arc<crate::neural::NeuralEngine>) -> Self {
-        self.neural_engine = Some(engine);
-        self
+    /// Bumped by every change that can change the suggestions.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
-    /// Set or clear the attached neural engine.
-    pub fn set_neural_engine(&mut self, engine: Option<std::sync::Arc<crate::neural::NeuralEngine>>) {
-        self.neural_engine = engine;
+    /// Nothing of the current sentence is typed: no partial word and
+    /// no committed context (at launch and after Enter).
+    pub fn sentence_is_empty(&self) -> bool {
+        self.partial.lower.is_empty() && self.sentence_context.is_empty()
     }
 
-    fn poll_neural(&self) -> Option<Vec<&'static str>> {
-        if let Some(ref e) = self.neural_engine {
-            e.poll()
-        } else {
-            crate::neural::with_engine(|e| e.poll()).flatten()
-        }
+    /// The text the neural engine predicts the next word after: the
+    /// sentence so far, with the partial word committed the way a space
+    /// would commit it, so a request made mid-word is the one the
+    /// space needs. None at a sentence start.
+    pub fn neural_prompt(&self) -> Option<String> {
+        prompt_of(&self.context_after(&self.partial.lower))
     }
 
-    /// Kick off a background neural prediction for the current
-    /// sentence, when an engine is active.
-    fn request_neural(&self) {
-        let prompt = self.sentence_context.trim_end();
-        if prompt.is_empty() {
-            return;
-        }
-        if let Some(ref e) = self.neural_engine {
-            e.request(prompt);
-        } else {
-            crate::neural::with_engine(|e| e.request(prompt));
-        }
+    /// A lowercase word from the vocabulary, the lexicon or the user's
+    /// learned words.
+    pub fn is_known(&self, w: &str) -> bool {
+        model().id_of(w).is_some()
+            || WORD_RANK.contains_key(w)
+            || self.user_history.user_unigram_count(w) > 0
     }
 
-    /// The current partial word.
+    /// The prompt for the word being typed: the sentence before it.
+    pub fn context_prompt(&self) -> Option<String> {
+        prompt_of(&self.sentence_context)
+    }
+
+    /// The prompt after a click on the pill `word`, the way
+    /// [`Predictor::commit`] commits it.
+    pub fn neural_prompt_after(&self, word: &str) -> Option<String> {
+        prompt_of(&self.context_after(&clean_word(word)))
+    }
+
+    /// The current partial word (lowercased).
     #[inline]
     pub fn partial(&self) -> &str {
-        &self.partial
+        &self.partial.lower
+    }
+
+    /// The current partial word with the letter case it was typed in.
+    #[inline]
+    pub fn typed(&self) -> &str {
+        &self.partial.typed
     }
 
     /// (id of the word before last, id of the last word) when known.
     fn context(&self) -> (Option<u16>, Option<u16>) {
         let m = model();
-        let pa = (!self.prev_word.is_empty())
-            .then(|| m.id_of(&self.prev_word))
+        let pa = (!self.words.prev.is_empty())
+            .then(|| m.id_of(&self.words.prev))
             .flatten();
-        let la = (!self.last_word.is_empty())
-            .then(|| m.id_of(&self.last_word))
+        let la = (!self.words.last.is_empty())
+            .then(|| m.id_of(&self.words.last))
             .flatten();
         (pa, la)
     }
@@ -665,7 +762,7 @@ impl Predictor {
                 }
             }
         }
-        for (w, _) in self.user_history.user_bigram_followers(&self.last_word) {
+        for (w, _) in self.user_history.user_bigram_followers(&self.words.last) {
             if !out.contains(&w) {
                 out.push(w);
             }
@@ -674,18 +771,22 @@ impl Predictor {
     }
 
     /// Up to [`MAX_SUGG`] suggestions for the current state using Google Keyboard
-    /// (Gboard) interpolated scoring.
-    pub fn suggestions(&self) -> Vec<&'static str> {
+    /// (Gboard) interpolated scoring. `neural` is the neural ranking of
+    /// the next word after the sentence so far, as its owner adopted
+    /// it (empty for none): its top words lead the next-word pills,
+    /// and while a word is typed its matches boost the completions.
+    // One coherent scoring pipeline (context tiers, correction merge,
+    // cache refill); splitting it would scatter a single contract.
+    #[allow(clippy::too_many_lines)]
+    pub fn suggestions(&self, neural: &[&'static str]) -> Vec<&'static str> {
         let m = model();
 
         if self.partial.is_empty() {
-            // Ready neural predictions take priority in the next-word
-            // pills; the n-gram row fills the remaining slots.
+            // Neural predictions take priority in the next-word pills;
+            // the n-gram row fills the remaining slots.
             let mut row: Vec<&'static str> = Vec::new();
-            if let Some(words) = self.poll_neural() {
-                for w in words {
-                    push_sugg(&mut row, w);
-                }
+            for &w in neural {
+                push_sugg(&mut row, w);
             }
             let followers = self.followers();
             if followers.is_empty() || self.at_sentence_start {
@@ -737,7 +838,7 @@ impl Predictor {
                         .user_history
                         .bigrams
                         .iter()
-                        .find(|(a, b, _)| *a == self.last_word && *b == w)
+                        .find(|(a, b, _)| *a == self.words.last && *b == w)
                         .map(|(_, _, c)| *c)
                         .unwrap_or(0);
                     score += (u_bg as i32 * 600).min(3000);
@@ -749,7 +850,7 @@ impl Predictor {
                 })
                 .collect();
 
-            scored.sort_by(|a, b| b.1.cmp(&a.1));
+            scored.sort_by_key(|&(_, s)| std::cmp::Reverse(s));
             let out = take_top(scored);
             let mut merged = std::mem::take(&mut row);
             for w in &out {
@@ -762,7 +863,7 @@ impl Predictor {
         }
 
         // Prefix completion with context-boosted interpolated ranking
-        let p = self.partial.as_str();
+        let p = self.partial.lower.as_str();
         let followers = self.followers();
         let (pa, la) = self.context();
         let trigram_slice = match (pa, la) {
@@ -774,17 +875,7 @@ impl Predictor {
             _ => &[],
         };
 
-        // Mid-word typing: restrict neural predictions from the preceding context
-        // to tokens consistent with the typed prefix instead of running a new pass per keystroke.
-        let neural_words = self.poll_neural().unwrap_or_default();
-
         let mut candidates: Vec<&'static str> = Vec::new();
-        // Neural predictions consistent with typed prefix
-        for &w in &neural_words {
-            if w.starts_with(p) && !candidates.contains(&w) {
-                candidates.push(w);
-            }
-        }
         // Contextual followers starting with prefix
         for &w in &followers {
             if w.starts_with(p) && !candidates.contains(&w) {
@@ -800,9 +891,32 @@ impl Predictor {
                 }
             }
         }
+        // Model vocabulary words starting with prefix, for completions
+        // the lexicon lacks
+        for w in (0..u16::MAX).map_while(|id| m.word(id)) {
+            if candidates.len() >= 250 {
+                break;
+            }
+            if w.starts_with(p) && !candidates.contains(&w) {
+                candidates.push(w);
+            }
+        }
         // Learned words starting with prefix, including out-of-vocabulary ones
         for (w, _) in &self.user_history.unigrams {
-            if w.starts_with(p) && !candidates.contains(&w) {
+            if w.starts_with(p) && !candidates.contains(w) {
+                candidates.push(w);
+            }
+        }
+        // The neural ranking's known words starting with prefix, best
+        // first. The model also ranks word pieces ("groc" for
+        // "grocery"), which must not become pills.
+        let neural: Vec<&'static str> = neural
+            .iter()
+            .copied()
+            .filter(|w| w.starts_with(p) && self.is_known(w))
+            .collect();
+        for &w in &neural {
+            if !candidates.contains(&w) {
                 candidates.push(w);
             }
         }
@@ -810,75 +924,99 @@ impl Predictor {
         let mut scored: Vec<(&'static str, i32)> = candidates
             .into_iter()
             .map(|w| {
-                let mut score = 0;
-                // Neural context boost for prefix-consistent candidates
-                if let Some(pos) = neural_words.iter().position(|x| *x == w) {
-                    score += match pos {
-                        0 => 8000,
-                        1 => 7000,
-                        2 => 6000,
-                        _ => 5000,
-                    };
-                }
-                // Trigram context boost
-                if let Some(id) = m.id_of(w) {
-                    if let Some(pos) = trigram_slice.iter().position(|&s| s == id) {
-                        score += match pos {
-                            0 => 4000,
-                            1 => 3200,
-                            2 => 2500,
-                            _ => 2000,
-                        };
-                    }
-                    if let Some(pos) = bigram_slice.iter().position(|&s| s == id) {
-                        score += match pos {
-                            0 => 2000,
-                            1 => 1600,
-                            2 => 1200,
-                            3 => 800,
-                            4 => 400,
-                            _ => 200,
-                        };
-                    }
-                }
-
-                // Dynamic user history boost
-                let u_bg = self
-                    .user_history
-                    .bigrams
-                    .iter()
-                    .find(|(a, b, _)| *a == self.last_word && *b == w)
-                    .map(|(_, _, c)| *c)
-                    .unwrap_or(0);
-                score += (u_bg as i32 * 500).min(2500);
-
-                let u_uni = self.user_history.user_unigram_count(w);
-                score += (u_uni as i32 * 100).min(800);
-
-                // Global unigram frequency prior (position in WORDS)
-                if let Some(rank) = WORDS.iter().position(|&s| s == w) {
-                    score += ((WORDS.len() as i32) - rank as i32) / 4;
-                }
-
+                let mut score = self.completion_score(w, p, trigram_slice, bigram_slice);
                 // Exact match completion bonus
                 if w == p {
                     score += 800;
                 }
-
-                // Length brevity bonus (prefer immediate completions)
-                let delta = w.len().saturating_sub(p.len());
-                if delta <= 2 {
-                    score += 150;
-                } else if delta <= 4 {
-                    score += 75;
+                if let Some(rank) = neural.iter().position(|&n| n == w) {
+                    score += neural_boost(rank);
                 }
-
                 (w, score)
             })
             .collect();
 
-        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        // Spelling corrections compete with the completions, discounted
+        // by how far the typed letters are from the word. The partial is
+        // only trusted to match the text field while it is uncapped.
+        if p.len() < WORD_LEN {
+            let known = self.is_known(p);
+            let mut cache = self.spell_cache.borrow_mut();
+            if cache.as_ref().map(|(k, _)| *k) != Some(self.revision) {
+                let learned = self.user_history.unigrams.iter().map(|(w, _)| w);
+                *cache = Some((self.revision, spell::corrections(p, known, learned)));
+            }
+            let corrections = cache.as_ref().map(|(_, c)| c.as_slice()).unwrap_or(&[]);
+            for &c in corrections {
+                let mut score = self.completion_score(c.word, p, trigram_slice, bigram_slice);
+                score -= i32::from(c.cost) * CORRECTION_PENALTY;
+                if c.whole {
+                    score += WHOLE_CORRECTION_BONUS;
+                }
+                scored.push((c.word, score));
+            }
+        }
+
+        scored.sort_by_key(|&(_, s)| std::cmp::Reverse(s));
         take_top(scored)
+    }
+
+    /// Context, history, frequency and brevity score for a candidate
+    /// completing (or correcting) the partial `p`.
+    fn completion_score(
+        &self,
+        w: &'static str,
+        p: &str,
+        trigram_slice: &[u16],
+        bigram_slice: &[u16],
+    ) -> i32 {
+        let m = model();
+        let mut score = 0;
+        // Trigram context boost
+        if let Some(id) = m.id_of(w) {
+            if let Some(pos) = trigram_slice.iter().position(|&s| s == id) {
+                score += match pos {
+                    0 => 4000,
+                    1 => 3200,
+                    2 => 2500,
+                    _ => 2000,
+                };
+            }
+            if let Some(pos) = bigram_slice.iter().position(|&s| s == id) {
+                score += match pos {
+                    0 => 2000,
+                    1 => 1600,
+                    2 => 1200,
+                    3 => 800,
+                    4 => 400,
+                    _ => 200,
+                };
+            }
+        }
+
+        // Dynamic user history boost
+        let u_bg = self
+            .user_history
+            .bigrams
+            .iter()
+            .find(|(a, b, _)| *a == self.words.last && *b == w)
+            .map(|(_, _, c)| *c)
+            .unwrap_or(0);
+        score += (u_bg as i32 * 500).min(2500);
+
+        let u_uni = self.user_history.user_unigram_count(w);
+        score += (u_uni as i32 * 100).min(800);
+
+        score += frequency_prior(w);
+
+        // Length brevity bonus (prefer immediate completions)
+        let delta = w.len().saturating_sub(p.len());
+        if delta <= 2 {
+            score += 150;
+        } else if delta <= 4 {
+            score += 75;
+        }
+        score
     }
 
     /// Sentence-start fallback: common openers blended with the user's
@@ -895,5 +1033,63 @@ impl Predictor {
             }
         }
         take_top(scored)
+    }
+}
+
+// ---- tests: the pure predictor's history contract ----
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commit_sets_the_history_dirty_flag() {
+        let mut p = Predictor::ephemeral();
+        assert!(!p.take_history_dirty());
+        p.commit("hello");
+        assert!(p.take_history_dirty());
+        assert!(!p.take_history_dirty(), "take consumes the flag");
+    }
+
+    #[test]
+    fn history_tsv_round_trips_learned_words_and_bigrams() {
+        let mut p = Predictor::ephemeral();
+        p.commit("hello");
+        p.commit("world");
+        let tsv = p.history_tsv();
+        assert!(
+            tsv.lines().any(|l| l == "u\thello\t\t1")
+                && tsv.lines().any(|l| l == "b\thello\tworld\t1"),
+            "{tsv:?}"
+        );
+
+        let mut q = Predictor::ephemeral();
+        q.load_history_tsv(&tsv);
+        assert_eq!(q.history_tsv(), tsv, "round trip preserves the entries");
+        assert!(q.is_learned("hello") && q.is_learned("world"));
+    }
+
+    /// "i want to e", typed through the predictor.
+    fn typing_e_after_i_want_to() -> Predictor {
+        let mut p = Predictor::ephemeral();
+        for w in ["i", "want", "to"] {
+            p.commit(w);
+        }
+        p.char('e');
+        p
+    }
+
+    #[test]
+    fn neural_ranking_lifts_a_known_completion() {
+        let p = typing_e_after_i_want_to();
+        assert!(!p.suggestions(&[]).contains(&"explore"));
+        assert!(p.suggestions(&["explore"]).contains(&"explore"));
+    }
+
+    #[test]
+    fn neural_word_pieces_never_become_completions() {
+        let p = typing_e_after_i_want_to();
+        assert!(!p.is_known("exq"));
+        assert!(!p.suggestions(&["exq"]).contains(&"exq"));
     }
 }

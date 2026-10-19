@@ -1,6 +1,6 @@
 [package]
 name = "osk-win"
-description = "Windows on-screen keyboard: topmost Win32 window, GDI+ rendering, SendInput injection."
+description = "Windows on-screen keyboard: the Linux osk core and painters on a topmost Win32 window, GDI rendering and SendInput injection."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -17,5 +17,6 @@ cpal = { workspace = true, optional = true }
 whisper-rs = { workspace = true, optional = true }
 
 [features]
-default = ["dictation"]
+default = ["neural", "dictation"]
+neural = ["oskwin-core/neural"]
 dictation = ["dep:cpal", "dep:whisper-rs"]

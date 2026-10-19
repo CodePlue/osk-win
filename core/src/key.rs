@@ -3,6 +3,13 @@
 //! The KEY_* value is the single currency of osk: layouts produce them and
 //! both injection backends (Wayland virtual-keyboard and /dev/uinput)
 //! consume them directly. Values come from `<linux/input-event-codes.h>`.
+//!
+//! Key behavior is data: [`KeyKind`] says whether a key injects (and how
+//! its click behaves) or is an inert [`KeyKind::Gap`]. There is no
+//! code-0 sentinel; `tap_events` takes a [`TapKey`] that can only be
+//! built from a [`Click::Tap`] key.
+
+use std::num::NonZeroU16;
 
 /// Linux KEY_* event codes used by the osk layouts.
 #[allow(clippy::module_inception)]
@@ -101,39 +108,150 @@ pub mod key {
     pub const KEY_KPEQUAL: u16 = 117;
 }
 
-/// One key. `code` is a linux input event code (KEY_*), exactly what both
-/// injection backends consume.
+/// Build a [`NonZeroU16`] in a `const` context: `0` is a [`KeyKind::Gap`],
+/// never an injectable code.
+pub const fn nz(code: u16) -> NonZeroU16 {
+    match NonZeroU16::new(code) {
+        Some(v) => v,
+        None => panic!("key code 0 is a Gap, use Key::inert"),
+    }
+}
+
+/// How a click on an injectable key behaves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Click {
+    /// Normal key: injects via `tap_events`.
+    Tap,
+    /// Win/Alt style: one press injects one press+release, no latch.
+    Momentary,
+    /// Shift/Ctrl style: runs the 3-state latch machine.
+    Latch,
+    /// Caps Lock: flips the caps toggle.
+    Caps,
+}
+
+/// Whether a key injects and how, or is an inert spacing gap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyKind {
+    /// An injectable key.
+    Inject {
+        /// KEY_* code, never 0.
+        code: NonZeroU16,
+        /// Click behavior.
+        click: Click,
+    },
+    /// Drawn (or skipped) but never injected. `Key::inert(None, _)` is
+    /// the 0.5u spacing gap.
+    Gap,
+}
+
+/// A key that can be tapped: the proof that [`KeyKind`] was `Tap`.
+/// [`tap_events`](crate::events::tap_events) takes this, so a gap or a
+/// modifier key cannot reach injection at compile time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TapKey {
+    code: NonZeroU16,
+    letter: bool,
+}
+
+impl TapKey {
+    /// The KEY_* code to inject.
+    #[inline]
+    pub const fn code(self) -> NonZeroU16 {
+        self.code
+    }
+
+    /// The KEY_* code as a plain `u16`.
+    #[inline]
+    pub const fn code_u16(self) -> u16 {
+        self.code.get()
+    }
+
+    /// Whether case follows the modifier state.
+    #[inline]
+    pub const fn is_letter(self) -> bool {
+        self.letter
+    }
+}
+
+/// One key. Injectable keys carry their KEY_* code in [`KeyKind`];
+/// gaps carry none.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Key {
     /// Base (unshifted) display text; `None` = blank (space bar).
     pub label: Option<&'static str>,
-    /// KEY_* code.
-    pub code: u16,
+    /// Inject behavior or gap.
+    pub kind: KeyKind,
     /// `true` = alphabetic; case follows modifier state.
     pub letter: bool,
     /// Width in 1/20 key units (20 = normal).
     pub width: u16,
     /// `true` = repeats while held.
     pub repeat: bool,
-    /// `true` = shift/caps toggle key.
-    pub toggle: bool,
-    /// `true` = momentary modifier (ctrl/alt/win).
-    pub moment: bool,
     /// Shifted display text (numbers/symbols); `None` = none.
     pub shift_label: Option<&'static str>,
 }
 
 impl Key {
+    /// Whether this key is an inert gap.
+    #[inline]
+    pub const fn is_gap(&self) -> bool {
+        matches!(self.kind, KeyKind::Gap)
+    }
+
+    /// The KEY_* code, or `None` for a gap.
+    #[inline]
+    pub fn code(&self) -> Option<NonZeroU16> {
+        match self.kind {
+            KeyKind::Inject { code, .. } => Some(code),
+            KeyKind::Gap => None,
+        }
+    }
+
+    /// The KEY_* code as `u16`, or `0` for a gap (for table checks and
+    /// predictor dispatch; injection uses [`TapKey`]).
+    #[inline]
+    pub fn code_u16(&self) -> u16 {
+        match self.kind {
+            KeyKind::Inject { code, .. } => code.get(),
+            KeyKind::Gap => 0,
+        }
+    }
+
+    /// Click behavior, or `None` for a gap.
+    #[inline]
+    pub fn click(&self) -> Option<Click> {
+        match self.kind {
+            KeyKind::Inject { click, .. } => Some(click),
+            KeyKind::Gap => None,
+        }
+    }
+
+    /// The tappable projection: `Some` only for [`Click::Tap`] keys.
+    #[inline]
+    pub fn tap(&self) -> Option<TapKey> {
+        match self.kind {
+            KeyKind::Inject {
+                code,
+                click: Click::Tap,
+            } => Some(TapKey {
+                code,
+                letter: self.letter,
+            }),
+            _ => None,
+        }
+    }
     /// A key with no shifted label and no special flags.
     pub const fn plain(label: &'static str, code: u16, width: u16) -> Self {
         Key {
             label: Some(label),
-            code,
+            kind: KeyKind::Inject {
+                code: nz(code),
+                click: Click::Tap,
+            },
             letter: false,
             width,
             repeat: false,
-            toggle: false,
-            moment: false,
             shift_label: None,
         }
     }
@@ -142,12 +260,13 @@ impl Key {
     pub const fn letter(label: &'static str, code: u16) -> Self {
         Key {
             label: Some(label),
-            code,
+            kind: KeyKind::Inject {
+                code: nz(code),
+                click: Click::Tap,
+            },
             letter: true,
             width: 20,
             repeat: true,
-            toggle: false,
-            moment: false,
             shift_label: None,
         }
     }
@@ -156,12 +275,13 @@ impl Key {
     pub const fn sym(label: &'static str, code: u16, shift_label: &'static str) -> Self {
         Key {
             label: Some(label),
-            code,
+            kind: KeyKind::Inject {
+                code: nz(code),
+                click: Click::Tap,
+            },
             letter: false,
             width: 20,
             repeat: true,
-            toggle: false,
-            moment: false,
             shift_label: Some(shift_label),
         }
     }
@@ -175,12 +295,13 @@ impl Key {
     ) -> Self {
         Key {
             label: Some(label),
-            code,
+            kind: KeyKind::Inject {
+                code: nz(code),
+                click: Click::Tap,
+            },
             letter: false,
             width,
             repeat: true,
-            toggle: false,
-            moment: false,
             shift_label: Some(shift_label),
         }
     }
@@ -188,40 +309,60 @@ impl Key {
     pub const fn wide(label: &'static str, code: u16, width: u16) -> Self {
         Key {
             label: Some(label),
-            code,
+            kind: KeyKind::Inject {
+                code: nz(code),
+                click: Click::Tap,
+            },
             letter: false,
             width,
             repeat: false,
-            toggle: false,
-            moment: false,
             shift_label: None,
         }
     }
 
-    /// A toggle key (Shift/Caps): does not repeat.
-    pub const fn toggle_key(label: &'static str, code: u16, width: u16) -> Self {
+    /// A latching modifier (Shift/Ctrl): runs the 3-state machine
+    /// (OFF -> LATCHED -> LOCKED -> OFF). Does not repeat.
+    pub const fn latch(label: &'static str, code: u16, width: u16) -> Self {
         Key {
             label: Some(label),
-            code,
+            kind: KeyKind::Inject {
+                code: nz(code),
+                click: Click::Latch,
+            },
             letter: false,
             width,
             repeat: false,
-            toggle: true,
-            moment: false,
             shift_label: None,
         }
     }
 
-    /// A momentary modifier (ctrl/alt/win): does not repeat.
+    /// Caps Lock: flips the caps toggle. Does not repeat.
+    pub const fn caps(label: &'static str, code: u16, width: u16) -> Self {
+        Key {
+            label: Some(label),
+            kind: KeyKind::Inject {
+                code: nz(code),
+                click: Click::Caps,
+            },
+            letter: false,
+            width,
+            repeat: false,
+            shift_label: None,
+        }
+    }
+
+    /// A momentary modifier (Win/Alt): one press injects one
+    /// press+release, never latches. Does not repeat.
     pub const fn momentary(label: &'static str, code: u16, width: u16) -> Self {
         Key {
             label: Some(label),
-            code,
+            kind: KeyKind::Inject {
+                code: nz(code),
+                click: Click::Momentary,
+            },
             letter: false,
             width,
             repeat: false,
-            toggle: false,
-            moment: true,
             shift_label: None,
         }
     }
@@ -230,12 +371,13 @@ impl Key {
     pub const fn wide_repeat(label: &'static str, code: u16, width: u16) -> Self {
         Key {
             label: Some(label),
-            code,
+            kind: KeyKind::Inject {
+                code: nz(code),
+                click: Click::Tap,
+            },
             letter: false,
             width,
             repeat: true,
-            toggle: false,
-            moment: false,
             shift_label: None,
         }
     }
@@ -244,27 +386,26 @@ impl Key {
     pub const fn space(width: u16) -> Self {
         Key {
             label: None,
-            code: key::KEY_SPACE,
+            kind: KeyKind::Inject {
+                code: nz(key::KEY_SPACE),
+                click: Click::Tap,
+            },
             letter: false,
             width,
             repeat: true,
-            toggle: false,
-            moment: false,
             shift_label: None,
         }
     }
 
-    /// An inert key (code 0): drawn but never injected. Used for the
-    /// 0.5u gap before the arrow cluster.
+    /// An inert gap: drawn (when labeled) but never injected. Used for
+    /// the 0.5u gap before the arrow cluster.
     pub const fn inert(label: Option<&'static str>, width: u16) -> Self {
         Key {
             label,
-            code: 0,
+            kind: KeyKind::Gap,
             letter: false,
             width,
             repeat: false,
-            toggle: false,
-            moment: false,
             shift_label: None,
         }
     }

@@ -5,6 +5,7 @@
 #   ./sync-linux.sh log       # View recent commits from Linux OSK
 #   ./sync-linux.sh diff      # Compare UI / dictate code with Linux OSK
 #   ./sync-linux.sh core      # Sync shared core engine files from Linux OSK
+#   ./sync-linux.sh render    # Sync the shared painters (osk/src/render.rs)
 #   ./sync-linux.sh check     # Cross-compile and run full test suite
 #   ./sync-linux.sh status    # Check sync status and latest commit comparison
 set -euo pipefail
@@ -69,14 +70,29 @@ cmd_core() {
         echo "  - Updating $fname"
         cp "$file" "$SCRIPT_DIR/core/src/$fname"
     done
+    cp "$LINUX_REPO"/osk-core/data/* "$SCRIPT_DIR/core/data/"
+    for file in "$LINUX_REPO"/osk-core/tests/*.rs; do
+        # The vendored crate is named oskwin_core.
+        sed 's/\bosk_core::/oskwin_core::/g' "$file" > "$SCRIPT_DIR/core/tests/$(basename "$file")"
+    done
     echo "[sync] Core engine sync complete. Running verification tests..."
+    cmd_check
+}
+
+cmd_render() {
+    ensure_remote
+    # render.rs paints through crate::cairo, the GDI implementation of
+    # the cairo calls it makes; only its import line differs.
+    sed 's/^use cairo::{/use crate::cairo::{self, /' "$LINUX_REPO/osk/src/render.rs" \
+        > "$SCRIPT_DIR/osk-win/src/render.rs"
+    echo "[sync] render.rs synced. Running verification tests..."
     cmd_check
 }
 
 cmd_check() {
     echo "[sync] Compiling workspace and running automated test suites..."
     source "$SCRIPT_DIR/toolchain.sh"
-    cargo test --target "$TARGET" --features dictation
+    cargo test --target "$TARGET" --workspace
     echo "[sync] All tests passed cleanly!"
 }
 
@@ -86,9 +102,10 @@ case "$CMD" in
     log)    cmd_log ;;
     diff)   cmd_diff ;;
     core)   cmd_core ;;
+    render) cmd_render ;;
     check)  cmd_check ;;
     *)
-        echo "Usage: $0 {status|log|diff|core|check}" >&2
+        echo "Usage: $0 {status|log|diff|core|render|check}" >&2
         exit 1
         ;;
 esac

@@ -8,9 +8,12 @@ authors.workspace = true
 
 [dependencies]
 parking_lot = { workspace = true }
+candle-core = { workspace = true, optional = true }
+candle-transformers = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+rayon = { workspace = true, optional = true }
+ahash = { workspace = true, optional = true }
 
-# The neural LLM predictor is deferred in this project. The feature exists so
-# the vendored neural.rs cfg conditions are valid; it compiles to a no-op
-# stub and the n-gram predictor is used unmodified.
 [features]
-neural = []
+default = ["neural"]
+neural = ["dep:candle-core", "dep:candle-transformers", "dep:tokenizers", "dep:rayon", "dep:ahash"]

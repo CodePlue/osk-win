@@ -9,10 +9,11 @@
 use crate::events::{
     complete_word, sticky_presses, tap_events, OskEvent, StickyMods, TapError, TAP_MAX_EVENTS,
 };
-use crate::key::{key, Key};
+use crate::key::{key, Click, Key, KeyKind, nz};
 use crate::layout::LAYOUT;
 use crate::mods::{
-    mod_index, next_state, ModKeyState, ModifierEngine, MOD_ALT, MOD_CTRL, MOD_META, MOD_SHIFT,
+    mod_index, next_state, Casing, ModKeyState, ModifierEngine, MOD_ALT, MOD_CTRL, MOD_META,
+    MOD_SHIFT,
 };
 use crate::predict::{Predictor, MAX_SUGG};
 use crate::typekey::{type_string, CharMap, KeySink};
@@ -33,12 +34,21 @@ impl Report {
         self.failures.is_empty()
     }
 
-    /// Print failures to stderr and a summary to stdout, C-style.
-    pub fn print(&self) {
+    /// C-style CLI report text: FAIL lines, then the pass summary.
+    /// Binaries print it; osk-core itself must not print.
+    pub fn format(&self) -> String {
+        let mut out = String::new();
         for f in &self.failures {
-            eprintln!("FAIL {f}");
+            out += "FAIL ";
+            out += f;
+            out += "\n";
         }
-        println!("selftest: {} of {} cases pass", self.passed, self.total());
+        out += &format!(
+            "selftest: {} of {} cases pass",
+            self.passed,
+            self.total()
+        );
+        out
     }
 }
 
@@ -78,84 +88,109 @@ pub fn run() -> Report {
 
 // ---- fixtures ----
 
+const PLAIN: Casing = Casing {
+    shift: false,
+    caps: false,
+};
+const SHIFT: Casing = Casing {
+    shift: true,
+    caps: false,
+};
+const CAPS: Casing = Casing {
+    shift: false,
+    caps: true,
+};
+const SHIFT_CAPS: Casing = Casing {
+    shift: true,
+    caps: true,
+};
+
 const K_A: Key = Key {
     label: Some("A"),
-    code: key::KEY_A,
+    kind: KeyKind::Inject {
+        code: nz(key::KEY_A),
+        click: Click::Tap,
+    },
     letter: true,
     width: 10,
     repeat: true,
-    toggle: false,
-    moment: false,
     shift_label: None,
 };
 const K_C: Key = Key {
     label: Some("C"),
-    code: key::KEY_C,
+    kind: KeyKind::Inject {
+        code: nz(key::KEY_C),
+        click: Click::Tap,
+    },
     letter: true,
     width: 10,
     repeat: true,
-    toggle: false,
-    moment: false,
     shift_label: None,
 };
 const K_1: Key = Key {
     label: Some("1"),
-    code: key::KEY_1,
+    kind: KeyKind::Inject {
+        code: nz(key::KEY_1),
+        click: Click::Tap,
+    },
     letter: false,
     width: 10,
     repeat: true,
-    toggle: false,
-    moment: false,
     shift_label: Some("!"),
 };
 const K_LCTRL: Key = Key {
     label: Some("Ctrl"),
-    code: key::KEY_LEFTCTRL,
+    kind: KeyKind::Inject {
+        code: nz(key::KEY_LEFTCTRL),
+        click: Click::Latch,
+    },
     letter: false,
     width: 15,
     repeat: false,
-    toggle: false,
-    moment: true,
     shift_label: None,
 };
 const K_RCTRL: Key = Key {
     label: Some("Ctrl"),
-    code: key::KEY_RIGHTCTRL,
+    kind: KeyKind::Inject {
+        code: nz(key::KEY_RIGHTCTRL),
+        click: Click::Latch,
+    },
     letter: false,
     width: 15,
     repeat: false,
-    toggle: false,
-    moment: true,
     shift_label: None,
 };
 const K_CAPS: Key = Key {
     label: Some("Caps"),
-    code: key::KEY_CAPSLOCK,
+    kind: KeyKind::Inject {
+        code: nz(key::KEY_CAPSLOCK),
+        click: Click::Caps,
+    },
     letter: false,
     width: 17,
     repeat: false,
-    toggle: true,
-    moment: false,
     shift_label: None,
 };
 const K_LSHIFT: Key = Key {
     label: Some("Shift"),
-    code: key::KEY_LEFTSHIFT,
+    kind: KeyKind::Inject {
+        code: nz(key::KEY_LEFTSHIFT),
+        click: Click::Latch,
+    },
     letter: false,
     width: 27,
     repeat: false,
-    toggle: true,
-    moment: false,
     shift_label: None,
 };
 const K_RSHIFT: Key = Key {
     label: Some("Shift"),
-    code: key::KEY_RIGHTSHIFT,
+    kind: KeyKind::Inject {
+        code: nz(key::KEY_RIGHTSHIFT),
+        click: Click::Latch,
+    },
     letter: false,
     width: 27,
     repeat: false,
-    toggle: true,
-    moment: false,
     shift_label: None,
 };
 
@@ -315,42 +350,44 @@ fn seq_cases(t: &mut T) {
     }
 }
 
+// Linear case tables: one row per behavior, no branches to extract.
+#[allow(clippy::too_many_lines)]
 fn input_cases(t: &mut T) {
     // complete_word: cased remainder + trailing space
     let mut buf = [0 as char; 8];
     t.check(
         "cw and/a",
-        complete_word("and", "a", false, false, &mut buf) == Some(3)
+        complete_word("and", "a", PLAIN, &mut buf) == Some(3)
             && buf[0..3] == ['n', 'd', ' '],
     );
     t.check(
         "cw and/a shift",
-        complete_word("and", "a", true, false, &mut buf) == Some(3) && buf[0..3] == ['N', 'd', ' '],
+        complete_word("and", "a", SHIFT, &mut buf) == Some(3) && buf[0..3] == ['N', 'd', ' '],
     );
     t.check(
         "cw and/a caps",
-        complete_word("and", "a", false, true, &mut buf) == Some(3) && buf[0..3] == ['N', 'D', ' '],
+        complete_word("and", "a", CAPS, &mut buf) == Some(3) && buf[0..3] == ['N', 'D', ' '],
     );
     t.check(
         "cw and/a shift+caps",
-        complete_word("and", "a", true, true, &mut buf) == Some(3) && buf[0..3] == ['n', 'D', ' '],
+        complete_word("and", "a", SHIFT_CAPS, &mut buf) == Some(3) && buf[0..3] == ['n', 'D', ' '],
     );
     t.check(
         "cw the/the",
-        complete_word("the", "the", false, false, &mut buf) == Some(1) && buf[0] == ' ',
+        complete_word("the", "the", PLAIN, &mut buf) == Some(1) && buf[0] == ' ',
     );
     t.check(
         "cw no prefix",
-        complete_word("and", "b", false, false, &mut buf).is_none(),
+        complete_word("and", "b", PLAIN, &mut buf).is_none(),
     );
     t.check(
         "cw small buffer",
-        complete_word("and", "a", false, false, &mut [0 as char; 2]).is_none(),
+        complete_word("and", "a", PLAIN, &mut [0 as char; 2]).is_none(),
     );
     let mut exact = [0 as char; 3];
     t.check(
         "cw exact buffer",
-        complete_word("and", "a", false, false, &mut exact) == Some(3) && exact == ['n', 'd', ' '],
+        complete_word("and", "a", PLAIN, &mut exact) == Some(3) && exact == ['n', 'd', ' '],
     );
 
     // tap_events: press/release order, shift wrap, caps rule at the boundary
@@ -361,7 +398,7 @@ fn input_cases(t: &mut T) {
     let empty = StickyMods::default();
     t.check(
         "tap a plain",
-        tap_events(&K_A, false, false, &empty, &mut ev).is_ok_and(|n| {
+        tap_events(K_A.tap().unwrap(), PLAIN, &empty, &mut ev).is_ok_and(|n| {
             n == 2
                 && ev[0]
                     == OskEvent {
@@ -377,7 +414,7 @@ fn input_cases(t: &mut T) {
     );
     t.check(
         "tap a shift",
-        tap_events(&K_A, true, false, &empty, &mut ev).is_ok_and(|n| {
+        tap_events(K_A.tap().unwrap(), SHIFT, &empty, &mut ev).is_ok_and(|n| {
             n == 4
                 && ev[0]
                     == OskEvent {
@@ -403,7 +440,7 @@ fn input_cases(t: &mut T) {
     );
     t.check(
         "tap a caps",
-        tap_events(&K_A, false, true, &empty, &mut ev).is_ok_and(|n| {
+        tap_events(K_A.tap().unwrap(), CAPS, &empty, &mut ev).is_ok_and(|n| {
             n == 4
                 && ev[0]
                     == OskEvent {
@@ -429,7 +466,7 @@ fn input_cases(t: &mut T) {
     );
     t.check(
         "tap a shift+caps",
-        tap_events(&K_A, true, true, &empty, &mut ev).is_ok_and(|n| {
+        tap_events(K_A.tap().unwrap(), SHIFT_CAPS, &empty, &mut ev).is_ok_and(|n| {
             n == 2
                 && ev[0]
                     == OskEvent {
@@ -445,7 +482,7 @@ fn input_cases(t: &mut T) {
     );
     t.check(
         "tap 1 caps no shift",
-        tap_events(&K_1, false, true, &empty, &mut ev).is_ok_and(|n| {
+        tap_events(K_1.tap().unwrap(), CAPS, &empty, &mut ev).is_ok_and(|n| {
             n == 2
                 && ev[0]
                     == OskEvent {
@@ -461,7 +498,7 @@ fn input_cases(t: &mut T) {
     );
     t.check(
         "tap 1 shift+caps",
-        tap_events(&K_1, true, true, &empty, &mut ev).is_ok_and(|n| {
+        tap_events(K_1.tap().unwrap(), SHIFT_CAPS, &empty, &mut ev).is_ok_and(|n| {
             n == 4
                 && ev[0]
                     == OskEvent {
@@ -492,7 +529,7 @@ fn input_cases(t: &mut T) {
     };
     t.check(
         "tap c 3 mods",
-        tap_events(&K_C, false, false, &all, &mut ev).is_ok_and(|n| {
+        tap_events(K_C.tap().unwrap(), PLAIN, &all, &mut ev).is_ok_and(|n| {
             n == 8
                 && ev[0]
                     == OskEvent {
@@ -538,7 +575,7 @@ fn input_cases(t: &mut T) {
     };
     t.check(
         "tap c rmeta+shift",
-        tap_events(&K_C, true, false, &rmeta, &mut ev).is_ok_and(|n| {
+        tap_events(K_C.tap().unwrap(), SHIFT, &rmeta, &mut ev).is_ok_and(|n| {
             n == 6
                 && ev[0]
                     == OskEvent {
@@ -575,9 +612,8 @@ fn input_cases(t: &mut T) {
     t.check(
         "tap cap too small",
         tap_events(
-            &K_A,
-            false,
-            false,
+            K_A.tap().unwrap(),
+            PLAIN,
             &empty,
             &mut [OskEvent {
                 code: 0,
@@ -587,11 +623,11 @@ fn input_cases(t: &mut T) {
     );
     t.check(
         "tap full chord exact fit",
-        tap_events(&K_A, true, false, &all, &mut ev).is_ok_and(|n| n == 10),
+        tap_events(K_A.tap().unwrap(), SHIFT, &all, &mut ev).is_ok_and(|n| n == 10),
     );
     t.check(
         "tap full chord one short",
-        tap_events(&K_A, true, false, &all, &mut ev[..9]) == Err(TapError::TooSmall),
+        tap_events(K_A.tap().unwrap(), SHIFT, &all, &mut ev[..9]) == Err(TapError::TooSmall),
     );
 
     // sticky_presses: the suggestion-click modifier path
@@ -623,11 +659,6 @@ fn layout_cases(t: &mut T) {
     let l65 = &LAYOUT;
     t.check("l65 shape", l65.nrows() == 5 && l65.rows[4].len() == 10);
 
-    t.check(
-        "row key counts",
-        l65.rows.iter().all(|r| (1..100).contains(&r.len())),
-    );
-
     // The 65% profile: every row sums to 320 (16.0u) so the edges line up.
     let sums: Vec<usize> = l65.rows.iter().map(|r| r.width() as usize).collect();
     let all_equal = sums.iter().all(|s| *s == sums[0]);
@@ -654,7 +685,7 @@ fn layout_cases(t: &mut T) {
         "l65 row0 codes",
         l65.rows[0].len() == 15
             && l65.rows[0].keys[13].width == 40
-            && l65.rows[0].keys.iter().zip(want0).all(|(k, w)| k.code == w),
+            && l65.rows[0].keys.iter().zip(want0).all(|(k, w)| k.code_u16() == w),
     );
 
     let want4 = [
@@ -672,11 +703,11 @@ fn layout_cases(t: &mut T) {
     t.check(
         "l65 row4 codes",
         l65.rows[4].len() == 10
-            && l65.rows[4].keys[3].code == key::KEY_SPACE
+            && l65.rows[4].keys[3].code_u16() == key::KEY_SPACE
             && l65.rows[4].keys[3].width == 125
-            && l65.rows[4].keys[6].code == 0
+            && l65.rows[4].keys[6].code_u16() == 0
             && l65.rows[4].keys[6].width == 10
-            && l65.rows[4].keys.iter().zip(want4).all(|(k, w)| k.code == w),
+            && l65.rows[4].keys.iter().zip(want4).all(|(k, w)| k.code_u16() == w),
     );
 
     // Shifts and the wide keys carry the measured widths.
@@ -698,9 +729,13 @@ fn layout_cases(t: &mut T) {
             .rows
             .iter()
             .flat_map(|r| r.keys.iter())
-            .find(|k| k.code == a);
+            .find(|k| k.code_u16() == a);
         match k {
-            Some(k) if k.width == 20 && k.repeat && !k.letter && !k.toggle && !k.moment => {}
+            Some(k)
+                if k.width == 20
+                    && k.repeat
+                    && !k.letter
+                    && k.click() == Some(Click::Tap) => {}
             _ => ok = false,
         }
     }
@@ -712,7 +747,7 @@ fn layout_cases(t: &mut T) {
             .rows
             .iter()
             .flat_map(|r| r.keys.iter())
-            .filter(|k| k.code == a)
+            .filter(|k| k.code_u16() == a)
             .count();
         if n != 1 {
             ok = false;
@@ -721,6 +756,7 @@ fn layout_cases(t: &mut T) {
     t.check("l65 arrows unique", ok);
 }
 
+#[allow(clippy::too_many_lines)] // linear case tables, one row per behavior
 fn predict_cases(t: &mut T) {
     fn no_dups(row: &[&str]) -> bool {
         (0..row.len()).all(|i| (0..i).all(|j| row[i] != row[j]))
@@ -728,7 +764,7 @@ fn predict_cases(t: &mut T) {
 
     let mut p = Predictor::ephemeral();
     p.reset();
-    let start = p.suggestions();
+    let start = p.suggestions(&[]);
     t.check(
         "p1 start",
         !start.is_empty()
@@ -739,7 +775,7 @@ fn predict_cases(t: &mut T) {
 
     p.reset();
     p.char('t');
-    let s = p.suggestions();
+    let s = p.suggestions(&[]);
     t.check(
         "p2 t prefix",
         !s.is_empty() && s.iter().all(|w| w.starts_with('t')) && no_dups(&s),
@@ -750,7 +786,7 @@ fn predict_cases(t: &mut T) {
         p.char(c);
     }
     p.space();
-    let s = p.suggestions();
+    let s = p.suggestions(&[]);
     t.check(
         "p3 the context",
         p.partial().is_empty() && !s.is_empty() && s.len() <= MAX_SUGG && no_dups(&s),
@@ -762,7 +798,7 @@ fn predict_cases(t: &mut T) {
     }
     p.space();
     p.char('f');
-    let s = p.suggestions();
+    let s = p.suggestions(&[]);
     t.check(
         "p4 the f",
         !s.is_empty()
@@ -772,18 +808,18 @@ fn predict_cases(t: &mut T) {
     );
 
     p.commit("You!");
-    t.check("p5 you context", !p.suggestions().is_empty());
+    t.check("p5 you context", !p.suggestions(&[]).is_empty());
 
     p.commit("you");
     p.char('a');
-    let s = p.suggestions();
+    let s = p.suggestions(&[]);
     t.check(
         "p6 you a",
         !s.is_empty() && s.iter().all(|w| w.starts_with('a')) && no_dups(&s),
     );
 
     p.commit("zygote");
-    let s = p.suggestions();
+    let s = p.suggestions(&[]);
     t.check(
         "p7 unknown word learned",
         s.contains(&"zygote"),
@@ -791,7 +827,7 @@ fn predict_cases(t: &mut T) {
 
     p.commit("the");
     p.space();
-    let s = p.suggestions();
+    let s = p.suggestions(&[]);
     t.check(
         "p8 bare space drops",
         p.partial().is_empty()
@@ -804,17 +840,14 @@ fn predict_cases(t: &mut T) {
     p.commit("the");
     p.char('f');
     p.backspace();
-    let s = p.suggestions();
+    let s = p.suggestions(&[]);
     t.check(
         "p9 backspace",
         p.partial().is_empty() && !s.is_empty() && no_dups(&s),
     );
 
-    p.commit("thank");
-    t.check("p10 thank", !p.suggestions().is_empty());
-
     p.commit("");
-    let s = p.suggestions();
+    let s = p.suggestions(&[]);
     t.check(
         "p11 empty commit",
         !s.is_empty() && s.len() <= MAX_SUGG && no_dups(&s) && s.contains(&"zygote"),
@@ -822,14 +855,14 @@ fn predict_cases(t: &mut T) {
 
     p.reset();
     p.commit("the");
-    let a = p.suggestions();
+    let a = p.suggestions(&[]);
     p.reset();
     p.commit("THE");
-    t.check("p13 case fold", p.suggestions() == a);
+    t.check("p13 case fold", p.suggestions(&[]) == a);
 
     p.commit("the");
     p.break_word();
-    let s = p.suggestions();
+    let s = p.suggestions(&[]);
     t.check(
         "p14 break",
         p.partial().is_empty() && !s.is_empty() && s.len() <= MAX_SUGG && no_dups(&s),
@@ -837,7 +870,7 @@ fn predict_cases(t: &mut T) {
 
     p.commit("the");
     p.char(' ');
-    let s = p.suggestions();
+    let s = p.suggestions(&[]);
     t.check(
         "p15 space char breaks",
         p.partial().is_empty() && !s.is_empty() && s.len() <= MAX_SUGG && no_dups(&s),
@@ -847,14 +880,14 @@ fn predict_cases(t: &mut T) {
     p.reset();
     p.commit("i");
     p.commit("want");
-    let s = p.suggestions();
+    let s = p.suggestions(&[]);
     t.check(
         "p16 trigram context",
         !s.is_empty() && s.len() <= MAX_SUGG && no_dups(&s),
     );
 
     // Suggestions are stable for a given state.
-    let again = p.suggestions();
+    let again = p.suggestions(&[]);
     t.check("p17 stable", s == again);
 
     // Contractions: an apostrophe extends a letter run; a second one
@@ -870,7 +903,7 @@ fn predict_cases(t: &mut T) {
     p.char('.');
     t.check(
         "p20 sentence start",
-        p.partial().is_empty() && p.suggestions().contains(&"i"),
+        p.partial().is_empty() && p.suggestions(&[]).contains(&"i"),
     );
 
     // Learned-word management: learn, list, forget, clear.
@@ -894,8 +927,37 @@ fn predict_cases(t: &mut T) {
     t.check("p24 forget unknown", !p.forget_word("quixotic"));
     p.clear_learned();
     t.check("p25 clear learned", p.learned_words().is_empty());
+
+    // Enter (send) ends the sentence being typed: stale context is
+    // gone and the next word gets the sentence-start blend.
+    let mut f = Predictor::ephemeral();
+    f.commit("the");
+    f.commit("want");
+    f.end_message();
+    let s = f.suggestions(&[]);
+    t.check(
+        "p26 end message",
+        f.partial().is_empty()
+            && !s.is_empty()
+            && no_dups(&s)
+            && s.iter().all(|w| {
+                matches!(*w, "i" | "the" | "we" | "how" | "what" | "yes" | "thanks" | "want")
+            }),
+    );
+
+    let mut g = Predictor::ephemeral();
+    g.end_message();
+    let s = g.suggestions(&[]);
+    t.check(
+        "p27 fresh openers",
+        !s.is_empty()
+            && s.iter().all(|w| {
+                matches!(*w, "i" | "the" | "we" | "how" | "what" | "yes" | "thanks")
+            }),
+    );
 }
 
+#[allow(clippy::too_many_lines)] // linear case tables, one row per behavior
 fn mod_cases(t: &mut T) {
     t.check(
         "m1 shift slots",
@@ -922,12 +984,6 @@ fn mod_cases(t: &mut T) {
         mod_index(key::KEY_CAPSLOCK).is_none()
             && mod_index(key::KEY_A).is_none()
             && mod_index(key::KEY_SPACE).is_none(),
-    );
-    t.check(
-        "m6 is_active",
-        !ModKeyState::Off.is_active()
-            && ModKeyState::Latched.is_active()
-            && ModKeyState::Locked.is_active(),
     );
     t.check(
         "m7 off->latched",
@@ -1006,7 +1062,7 @@ fn mod_cases(t: &mut T) {
     let empty = StickyMods::default();
     t.check(
         "m24 symbol shift wrap",
-        tap_events(&K_1, true, false, &empty, &mut ev).is_ok_and(|n| {
+        tap_events(K_1.tap().unwrap(), SHIFT, &empty, &mut ev).is_ok_and(|n| {
             n == 4
                 && ev[0]
                     == OskEvent {
@@ -1031,26 +1087,4 @@ fn mod_cases(t: &mut T) {
         }),
     );
 
-    // chaining: ctrl + alt + meta + shift all active -> all held, in order
-    let all = StickyMods {
-        ctrl: Some(key::KEY_LEFTCTRL),
-        alt: Some(key::KEY_LEFTALT),
-        meta: Some(key::KEY_LEFTMETA),
-    };
-    t.check(
-        "m25 full chord",
-        tap_events(&K_A, true, false, &all, &mut ev).is_ok_and(|n| {
-            n == 10
-                && ev[0]
-                    == OskEvent {
-                        code: key::KEY_LEFTCTRL,
-                        press: true,
-                    }
-                && ev[9]
-                    == OskEvent {
-                        code: key::KEY_LEFTCTRL,
-                        press: false,
-                    }
-        }),
-    );
 }

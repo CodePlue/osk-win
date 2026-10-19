@@ -5,7 +5,8 @@
 //! `n + 1 + 1` presses then the same releases in reverse, so at most
 //! [`TAP_MAX_EVENTS`] events (3 mods + shift + key).
 
-use crate::key::{key, Key};
+use crate::key::{key, TapKey};
+use crate::mods::Casing;
 
 /// Maximum events one tap can produce (3 sticky mods + shift + key).
 pub const TAP_MAX_EVENTS: usize = 10;
@@ -53,37 +54,26 @@ pub enum TapError {
     TooSmall,
 }
 
-/// Shift decision at the injection boundary: Caps Lock changes the
-/// case of letters only; an active Shift still shifts digits and
-/// symbols.
-fn tap_needs_shift(k: &Key, shift_active: bool, caps: bool) -> bool {
-    if k.moment || k.toggle {
-        return false;
-    }
-    if k.letter {
-        shift_active ^ caps
-    } else {
-        shift_active
-    }
-}
-
 /// Build the press/release sequence for tapping `k` under the given
-/// modifier state. Modifier and toggle keys produce no sequence (they
-/// change state instead of injecting). Returns the number of events
+/// modifier state. Takes a [`TapKey`], so gaps and modifier keys cannot
+/// reach injection: they have no `TapKey`. Returns the number of events
 /// written.
 pub fn tap_events(
-    k: &Key,
-    shift_active: bool,
-    caps: bool,
+    k: TapKey,
+    casing: Casing,
     sticky: &StickyMods,
     out: &mut [OskEvent],
 ) -> Result<usize, TapError> {
-    if k.moment || k.toggle {
-        return Ok(0);
-    }
     let mods = sticky.codes();
     let nd = mods.iter().filter(|m| m.is_some()).count();
-    let need_shift = tap_needs_shift(k, shift_active, caps);
+    // Shift decision at the injection boundary: Caps Lock changes the
+    // case of letters only; an active Shift still shifts digits and
+    // symbols.
+    let need_shift = if k.is_letter() {
+        casing.letter_upper()
+    } else {
+        casing.symbol_shift()
+    };
     let needed = (nd + usize::from(need_shift)) * 2 + 2;
     if out.len() < needed {
         return Err(TapError::TooSmall);
@@ -104,12 +94,12 @@ pub fn tap_events(
         idx += 1;
     }
     out[idx] = OskEvent {
-        code: k.code,
+        code: k.code_u16(),
         press: true,
     };
     idx += 1;
     out[idx] = OskEvent {
-        code: k.code,
+        code: k.code_u16(),
         press: false,
     };
     idx += 1;
@@ -151,8 +141,7 @@ pub fn sticky_presses(sticky: &StickyMods) -> [u16; 3] {
 pub fn complete_word(
     word: &str,
     partial: &str,
-    shift_active: bool,
-    caps: bool,
+    casing: Casing,
     out: &mut [char],
 ) -> Option<usize> {
     if !word.starts_with(partial) {
@@ -163,7 +152,7 @@ pub fn complete_word(
         .enumerate()
         .map(|(i, c)| {
             if c.is_ascii_lowercase() {
-                let upper = if i == 0 { shift_active ^ caps } else { caps };
+                let upper = if i == 0 { casing.letter_upper() } else { casing.caps };
                 if upper {
                     return c.to_ascii_uppercase();
                 }
@@ -179,4 +168,56 @@ pub fn complete_word(
         *slot = c;
     }
     Some(total)
+}
+
+/// The edit that turns the typed partial into `word`: how many
+/// backspaces to send, then the characters to type (with a trailing
+/// space) written to `out`.
+///
+/// A word that extends `partial` is a plain completion (no
+/// backspaces, cased by [`complete_word`]). Anything else is a
+/// spelling correction: the letters after the shared prefix are erased
+/// and the rest of `word` is retyped in the case of `typed` (the
+/// partial as typed): all caps when it was all caps, otherwise each
+/// letter follows the typed letter at the same position.
+///
+/// Returns `None` when the buffer is too small.
+pub fn replace_word(
+    word: &str,
+    partial: &str,
+    typed: &str,
+    casing: Casing,
+    out: &mut [char],
+) -> Option<(usize, usize)> {
+    if word.starts_with(partial) {
+        return complete_word(word, partial, casing, out).map(|n| (0, n));
+    }
+    let keep = word
+        .chars()
+        .zip(partial.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let erase = partial.chars().count() - keep;
+    let letters: Vec<char> = typed.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+    let all_caps = letters.len() >= 2 && letters.iter().all(|c| c.is_ascii_uppercase());
+    let typed: Vec<char> = typed.chars().collect();
+    let rest: Vec<char> = word
+        .chars()
+        .enumerate()
+        .skip(keep)
+        .map(|(i, c)| {
+            let upper = all_caps || typed.get(i).is_some_and(|t| t.is_ascii_uppercase());
+            if upper {
+                c.to_ascii_uppercase()
+            } else {
+                c
+            }
+        })
+        .chain(std::iter::once(' '))
+        .collect();
+    if out.len() < rest.len() {
+        return None;
+    }
+    out[..rest.len()].copy_from_slice(&rest);
+    Some((erase, rest.len()))
 }
