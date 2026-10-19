@@ -16,6 +16,9 @@ mod gdip;
 pub mod ui;
 mod vk;
 
+#[cfg(feature = "dictation")]
+pub mod dictate;
+
 use clap::{Parser, Subcommand};
 use gdip::Canvas;
 use oskwin_core::typekey::{type_string, CharMap};
@@ -31,6 +34,9 @@ struct Cli {
     /// Injection backend to use.
     #[arg(long, default_value = "sendinput")]
     backend: String,
+    /// Record audio and offline-transcribe for N seconds.
+    #[arg(long)]
+    dictate_test: Option<u64>,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -59,6 +65,26 @@ fn main() {
     }
 
     let cli = Cli::parse();
+    #[cfg(feature = "dictation")]
+    if let Some(secs) = cli.dictate_test {
+        let rc = match dictate::record_and_transcribe(secs) {
+            Ok(text) => {
+                println!("[dictate] transcribed:\n{}", text);
+                0
+            }
+            Err(e) => {
+                eprintln!("[dictate] error: {e}");
+                1
+            }
+        };
+        std::process::exit(rc);
+    }
+    #[cfg(not(feature = "dictation"))]
+    if cli.dictate_test.is_some() {
+        eprintln!("osk-win was built without --features dictation");
+        std::process::exit(1);
+    }
+
     let rc = if let Some(text) = cli.r#type {
         run_type(&text, &cli.backend)
     } else {

@@ -25,10 +25,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
     KillTimer, PostQuitMessage, RegisterClassExW, SetTimer, SetWindowPos, ShowWindow,
-    TranslateMessage, CS_HREDRAW, CS_VREDRAW, MSG, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
-    SW_SHOWNOACTIVATE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE,
-    WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    TranslateMessage, CS_HREDRAW, CS_VREDRAW, IDC_ARROW, LoadCursorW, MSG, SetCursor,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE, WM_DESTROY, WM_ERASEBKGND,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN,
+    WM_SETCURSOR, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -38,7 +39,7 @@ use crate::gdip::Canvas;
 use oskwin_core::events::{complete_word, tap_events, OskEvent, TAP_MAX_EVENTS};
 use oskwin_core::key::{key, Key, Layout};
 use oskwin_core::layout::ALL_LAYOUTS;
-use oskwin_core::mods::{mod_index, ModKeyState, ModifierEngine, MOD_META};
+use oskwin_core::mods::{mod_index, ModKeyState, ModifierEngine, MOD_ALT, MOD_META};
 use oskwin_core::predict::Predictor;
 use oskwin_core::typekey::{type_string, CharMap};
 
@@ -61,6 +62,15 @@ const FLASH_MS: u64 = 150;
 // Sans-serif face for the labels; it carries every glyph we draw
 // (letters, digits, and the arrow/symbol caps) in one font.
 const FONT: &str = "Adwaita Sans";
+
+/// Dictation lifecycle.
+#[cfg(feature = "dictation")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DictState {
+    Idle,
+    Recording,
+    Transcribing,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Theme {
@@ -453,6 +463,9 @@ struct BarLayout {
     dict_remove_rects: [Rect; 8],
     dict_words: [Option<&'static str>; 8],
     n_dict_items: usize,
+    mic_rect: Rect,
+    pred_toggle_rect: Rect,
+    tab_toggle_rect: Rect,
 }
 
 /// Saved preferences and window geometry persisted between runs.
@@ -472,6 +485,8 @@ pub struct PersistentConfig {
     pub height: i32,
     #[serde(default)]
     pub tab_accepts_prediction: bool,
+    #[serde(default = "default_prediction")]
+    pub prediction: bool,
 }
 
 fn default_pos_x() -> i32 {
@@ -480,6 +495,10 @@ fn default_pos_x() -> i32 {
 
 fn default_pos_y() -> i32 {
     450
+}
+
+fn default_prediction() -> bool {
+    true
 }
 
 impl Default for PersistentConfig {
@@ -492,6 +511,7 @@ impl Default for PersistentConfig {
             width: 0,
             height: 0,
             tab_accepts_prediction: false,
+            prediction: true,
         }
     }
 }
@@ -635,6 +655,9 @@ pub struct State {
     theme_menu_rect: Rect,
     theme_item_rects: [Rect; 12],
     tab_accepts_prediction: bool,
+    tab_toggle_rect: Rect,
+    prediction: bool,
+    pred_toggle_rect: Rect,
     dict_menu_open: bool,
     dict_page: usize,
     dict_rect: Rect,
@@ -646,6 +669,14 @@ pub struct State {
     dict_remove_rects: [Rect; 8],
     dict_words: [Option<&'static str>; 8],
     n_dict_items: usize,
+    // dictation
+    #[cfg(feature = "dictation")]
+    dict_state: DictState,
+    #[cfg(feature = "dictation")]
+    recorder: Option<crate::dictate::Recorder>,
+    #[cfg(feature = "dictation")]
+    dict_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    mic_rect: Rect,
     // control
     quit: bool,
 }
@@ -737,6 +768,9 @@ impl State {
             theme_menu_rect: Rect::default(),
             theme_item_rects: [Rect::default(); 12],
             tab_accepts_prediction: config.tab_accepts_prediction,
+            tab_toggle_rect: Rect::default(),
+            prediction: config.prediction,
+            pred_toggle_rect: Rect::default(),
             dict_menu_open: false,
             dict_page: 0,
             dict_rect: Rect::default(),
@@ -748,6 +782,13 @@ impl State {
             dict_remove_rects: [Rect::default(); 8],
             dict_words: [None; 8],
             n_dict_items: 0,
+            #[cfg(feature = "dictation")]
+            dict_state: DictState::Idle,
+            #[cfg(feature = "dictation")]
+            recorder: None,
+            #[cfg(feature = "dictation")]
+            dict_rx: None,
+            mic_rect: Rect::default(),
             quit: false,
         };
         state.compute_grid_cols();
@@ -763,6 +804,7 @@ impl State {
             width: self.width,
             height: self.height,
             tab_accepts_prediction: self.tab_accepts_prediction,
+            prediction: self.prediction,
         };
         config.save();
     }
@@ -946,8 +988,11 @@ impl State {
         self.layout_rect = bar.layout_rect;
         self.theme_rect = bar.theme_rect;
         self.close_rect = bar.close_rect;
+        self.mic_rect = bar.mic_rect;
         self.theme_menu_rect = bar.theme_menu_rect;
         self.theme_item_rects = bar.theme_item_rects;
+        self.tab_toggle_rect = bar.tab_toggle_rect;
+        self.pred_toggle_rect = bar.pred_toggle_rect;
         self.dict_rect = bar.dict_rect;
         self.dict_menu_rect = bar.dict_menu_rect;
         self.dict_tab_toggle_rect = bar.dict_tab_toggle_rect;
@@ -991,7 +1036,8 @@ impl State {
         // When enabled, Tab accepts the top suggestion (like clicking
         // the first pill); Shift+Tab passes through as a plain TAB.
         // By default Tab is a normal Tab key.
-        if self.tab_accepts_prediction
+        if self.prediction
+            && self.tab_accepts_prediction
             && k.code == key::KEY_TAB
             && !shift_active
             && !self.predictor.suggestions().is_empty()
@@ -1017,28 +1063,30 @@ impl State {
             }
         }
         self.mods.consume_latched();
-        match k.code {
-            key::KEY_BACKSPACE => self.predictor.backspace(),
-            key::KEY_SPACE => self.predictor.space(),
-            _ => {
-                // A single-character label (letters, symbols, arrows)
-                // feeds the predictor; multi-char labels (pgdn, esc)
-                // and modifiers break the word.
-                let single = k.label.and_then(|l| {
-                    let mut it = l.chars();
-                    match (it.next(), it.next()) {
-                        (Some(c), None) => Some(c),
-                        _ => None,
-                    }
-                });
-                if k.letter {
-                    if let Some(c) = k.label.and_then(|l| l.chars().next()) {
+        if self.prediction {
+            match k.code {
+                key::KEY_BACKSPACE => self.predictor.backspace(),
+                key::KEY_SPACE => self.predictor.space(),
+                _ => {
+                    // A single-character label (letters, symbols, arrows)
+                    // feeds the predictor; multi-char labels (pgdn, esc)
+                    // and modifiers break the word.
+                    let single = k.label.and_then(|l| {
+                        let mut it = l.chars();
+                        match (it.next(), it.next()) {
+                            (Some(c), None) => Some(c),
+                            _ => None,
+                        }
+                    });
+                    if k.letter {
+                        if let Some(c) = k.label.and_then(|l| l.chars().next()) {
+                            self.predictor.char(c);
+                        }
+                    } else if let Some(c) = single {
                         self.predictor.char(c);
+                    } else if !is_mod {
+                        self.predictor.break_word();
                     }
-                } else if let Some(c) = single {
-                    self.predictor.char(c);
-                } else if !is_mod {
-                    self.predictor.break_word();
                 }
             }
         }
@@ -1151,15 +1199,21 @@ impl State {
             0
         };
         let handle = self.handle_hov() as u32;
+        let mic_hov = self.mic_rect.contains(self.px as f64, self.py as f64) as u32;
+        let tab_hov = self.tab_toggle_rect.contains(self.px as f64, self.py as f64) as u32;
+        let pred_hov = self.pred_toggle_rect.contains(self.px as f64, self.py as f64) as u32;
         (key << 20)
             | (sugg << 15)
             | (layout_hov << 10)
             | (theme_hov << 9)
             | (menu_open << 8)
             | (menu_item << 4)
+            | (mic_hov << 2)
             | (close << 1)
             | (dict_menu_open << 12)
             | (dict_hov << 11)
+            | (tab_hov << 13)
+            | (pred_hov << 14)
             | (dict_item << 28)
             | handle
     }
@@ -1187,6 +1241,7 @@ impl State {
                 }
                 if self.dict_clear_rect.contains(self.px as f64, self.py as f64) {
                     self.predictor.clear_learned();
+                    self.predictor.break_word();
                     self.dict_page = 0;
                     self.save_config();
                     self.request_redraw();
@@ -1228,6 +1283,23 @@ impl State {
                 return;
             }
             if self.theme_menu_open {
+                // Prediction on/off toggle
+                if self.pred_toggle_rect.contains(self.px as f64, self.py as f64) {
+                    self.prediction = !self.prediction;
+                    if !self.prediction {
+                        self.predictor.break_word();
+                    }
+                    self.save_config();
+                    self.request_redraw();
+                    return;
+                }
+                // Tab accepts-prediction toggle
+                if self.tab_toggle_rect.contains(self.px as f64, self.py as f64) {
+                    self.tab_accepts_prediction = !self.tab_accepts_prediction;
+                    self.save_config();
+                    self.request_redraw();
+                    return;
+                }
                 // Check if user clicked an item in the menu
                 for i in 0..12 {
                     if self.theme_item_rects[i].contains(self.px as f64, self.py as f64) {
@@ -1251,6 +1323,13 @@ impl State {
                 self.theme_menu_open = false;
                 self.dict_menu_open = false;
                 self.request_redraw();
+                return;
+            }
+
+            // mic (dictation)
+            #[cfg(feature = "dictation")]
+            if self.mic_rect.contains(self.px as f64, self.py as f64) {
+                self.on_mic();
                 return;
             }
 
@@ -1321,9 +1400,14 @@ impl State {
                 return;
             };
             let key = *self.key_of(k);
-            // Win is momentary: one press injects one press+release and the
-            // keycap shows the press, then returns to normal. No latch.
-            if mod_index(key.code) == Some(MOD_META) {
+            // Win and Alt are momentary: one press injects one press+release
+            // and the keycap shows the press, then returns to normal. No
+            // latch. Alt must be a standalone press+release so Unity-style
+            // mouse-mode toggles fire; latching it for the next key would
+            // swallow the tap.
+            if mod_index(key.code) == Some(MOD_META)
+                || mod_index(key.code) == Some(MOD_ALT)
+            {
                 self.pressed = k as i32;
                 self.press_time = now_ms();
                 self.hold_fired = false;
@@ -1419,6 +1503,85 @@ impl State {
         }
     }
 
+    /// Mic button: start/stop dictation.
+    #[cfg(feature = "dictation")]
+    fn on_mic(&mut self) {
+        match self.dict_state {
+            DictState::Idle => {
+                match crate::dictate::Recorder::start() {
+                    Ok(rec) => {
+                        self.recorder = Some(rec);
+                        self.dict_state = DictState::Recording;
+                        self.request_redraw();
+                    }
+                    Err(e) => eprintln!("[dictate] {e}"),
+                }
+            }
+            DictState::Recording => {
+                let rec = match self.recorder.take() {
+                    Some(r) => r,
+                    None => {
+                        self.dict_state = DictState::Idle;
+                        self.request_redraw();
+                        return;
+                    }
+                };
+                let rate = rec.rate;
+                let raw = rec.stop();
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.dict_rx = Some(rx);
+                self.dict_state = DictState::Transcribing;
+                self.request_redraw();
+                std::thread::spawn(move || {
+                    let pcm = crate::dictate::resample_to_16k(&raw, rate as usize);
+                    let result = crate::dictate::transcribe(&pcm);
+                    let _ = tx.send(result);
+                });
+            }
+            DictState::Transcribing => {}
+        }
+    }
+
+    /// A transcription finished: type the text and return to idle.
+    #[cfg(feature = "dictation")]
+    fn finish_dictation(&mut self, result: Result<String, String>) {
+        self.dict_state = DictState::Idle;
+        self.request_redraw();
+        match result {
+            Ok(text) if !text.is_empty() => {
+                if let Some(map) = self.charmap.as_ref() {
+                    let pause = || std::thread::sleep(std::time::Duration::from_millis(20));
+                    let mut sink = BackendSink {
+                        b: &mut *self.backend,
+                    };
+                    if let Err(e) = oskwin_core::typekey::type_text(
+                        &mut sink,
+                        map,
+                        &text,
+                        pause,
+                    ) {
+                        eprintln!("[dictate] failed to type: {e:?}");
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("[dictate] {e}"),
+        }
+    }
+
+    #[cfg(feature = "dictation")]
+    fn handle_dictation(&mut self) {
+        if let Some(rx) = self.dict_rx.as_ref() {
+            if let Ok(result) = rx.try_recv() {
+                self.finish_dictation(result);
+                self.dict_rx = None;
+            }
+        }
+    }
+
+    #[cfg(not(feature = "dictation"))]
+    fn handle_dictation(&mut self) {}
+
     // ---- painting ----
 
     /// Measure the bar elements (suggestions, layout, theme icon, close)
@@ -1441,6 +1604,9 @@ impl State {
             dict_remove_rects: [Rect::default(); 8],
             dict_words: [None; 8],
             n_dict_items: 0,
+            mic_rect: Rect::default(),
+            pred_toggle_rect: Rect::default(),
+            tab_toggle_rect: Rect::default(),
         };
         let bh = self.bar_h();
         let k = self.k();
@@ -1473,11 +1639,28 @@ impl State {
             idx: 0,
         };
 
+        // 2b. Mic button (dictation), left of the theme icon.
+        #[cfg(feature = "dictation")]
+        let (_mic_x, next_anchor) = {
+            let mic_w = 0.75 * k;
+            let mx = th_x - mic_w - chip_gap;
+            bar.mic_rect = Rect {
+                x: mx,
+                y: 0.0,
+                w: mic_w,
+                h: bh,
+                idx: 0,
+            };
+            (mx, mx)
+        };
+        #[cfg(not(feature = "dictation"))]
+        let next_anchor = th_x;
+
         // 3. Dict chip
         let dict_label = "Dict";
         let dict_tw = self.text_w(cr, dict_label, chip_fs);
         let dict_w = dict_tw + 2.0 * chip_pad;
-        let dict_x = th_x - dict_w - chip_gap;
+        let dict_x = next_anchor - dict_w - chip_gap;
         bar.dict_rect = Rect {
             x: dict_x,
             y: 0.0,
@@ -1500,7 +1683,11 @@ impl State {
         };
 
         // 4. Centered word prediction
-        let suggs = self.predictor.suggestions();
+        let suggs: Vec<&'static str> = if self.prediction {
+            self.predictor.suggestions()
+        } else {
+            Vec::new()
+        };
         let avail_left = MARGIN_U * k + 0.1 * k;
         let avail_right = (lo_x - 0.2 * k).max(avail_left);
         if !suggs.is_empty() && avail_right > avail_left + 60.0 {
@@ -1563,16 +1750,18 @@ impl State {
             }
         }
 
-        // 6. Theme dropdown menu layout (2 columns x 6 rows)
+        // 6. Theme dropdown menu layout (2 toggle rows + 2 columns x 6 rows)
         if self.theme_menu_open {
             let col_w = 110.0;
             let row_h = 25.0;
             let col_gap = 6.0;
             let row_gap = 4.0;
             let pad = 8.0;
+            let toggle_h = 26.0;
+            let toggle_gap = 8.0;
 
             let menu_w = 2.0 * col_w + col_gap + 2.0 * pad;
-            let menu_h = 6.0 * row_h + 5.0 * row_gap + 2.0 * pad;
+            let menu_h = pad + 2.0 * (toggle_h + toggle_gap) + 6.0 * row_h + 5.0 * row_gap + pad;
 
             let menu_right = (th_x + th_w).min(self.width as f64 - MARGIN_U * k);
             let menu_x = (menu_right - menu_w).max(MARGIN_U * k);
@@ -1586,11 +1775,29 @@ impl State {
                 idx: 0,
             };
 
+            // Prediction on/off toggle (top row)
+            bar.pred_toggle_rect = Rect {
+                x: menu_x + pad,
+                y: menu_y + pad,
+                w: menu_w - 2.0 * pad,
+                h: toggle_h,
+                idx: 0,
+            };
+
+            // Tab accepts-prediction toggle (second row)
+            bar.tab_toggle_rect = Rect {
+                x: menu_x + pad,
+                y: menu_y + pad + toggle_h + toggle_gap,
+                w: menu_w - 2.0 * pad,
+                h: toggle_h,
+                idx: 0,
+            };
+
             for idx in 0..12 {
                 let col = idx / 6;
                 let row = idx % 6;
                 let ix = menu_x + pad + col as f64 * (col_w + col_gap);
-                let iy = menu_y + pad + row as f64 * (row_h + row_gap);
+                let iy = menu_y + pad + 2.0 * (toggle_h + toggle_gap) + row as f64 * (row_h + row_gap);
                 bar.theme_item_rects[idx] = Rect {
                     x: ix,
                     y: iy,
@@ -1896,6 +2103,28 @@ impl State {
         let icon_cy = bh / 2.0;
         self.draw_palette_icon(cr, icon_cx, icon_cy, 0.17 * k, th_fg);
 
+        // Mic button (dictation)
+        #[cfg(feature = "dictation")]
+        {
+            let mic_hov = self.inside && bar.mic_rect.contains(self.px as f64, self.py as f64);
+            let active = self.dict_state != DictState::Idle;
+            let (mic_bg, mic_fg) = if active {
+                (self.theme.accent, self.theme.on_bg)
+            } else if mic_hov {
+                (self.theme.on_bg, self.theme.accent)
+            } else {
+                (self.theme.key_mod, self.theme.modtxt)
+            };
+            let pad_y = bh * 0.16;
+            let chip_h = bh - 2.0 * pad_y;
+            rrect(cr, bar.mic_rect.x, pad_y, bar.mic_rect.w, chip_h, chip_h * 0.35);
+            set_src(cr, mic_bg);
+            let _ = cr.fill();
+            let mic_cx = bar.mic_rect.x + bar.mic_rect.w / 2.0;
+            let mic_cy = bh / 2.0;
+            self.draw_mic_icon(cr, mic_cx, mic_cy, k, mic_fg);
+        }
+
         let close_hov = self.inside && bar.close_rect.contains(self.px as f64, self.py as f64);
         self.draw_centered(
             cr,
@@ -1927,6 +2156,36 @@ impl State {
         }
     }
 
+    /// A simple microphone glyph: capsule body, holder bracket, stem, and base.
+    #[cfg(feature = "dictation")]
+    fn draw_mic_icon(&self, cr: &mut Canvas, cx: f64, cy: f64, k: f64, color: u32) {
+        set_src(cr, color);
+        let w = 0.14 * k;
+        let h = 0.22 * k;
+        let top = cy - 0.17 * k;
+        // Capsule body
+        rrect(cr, cx - w / 2.0, top, w, h, w / 2.0);
+        let _ = cr.fill();
+        // Holder bracket
+        let r = 0.12 * k;
+        let u_top = cy - 0.05 * k;
+        let u_bot = cy + 0.07 * k;
+        cr.new_path();
+        cr.set_line_width(1.4);
+        cr.move_to(cx - r, u_top);
+        cr.line_to(cx - r, u_bot);
+        cr.line_to(cx + r, u_bot);
+        cr.line_to(cx + r, u_top);
+        // Stem down
+        cr.move_to(cx, u_bot);
+        cr.line_to(cx, u_bot + 0.06 * k);
+        // Base plate
+        let bw = 0.10 * k;
+        cr.move_to(cx - bw / 2.0, u_bot + 0.06 * k);
+        cr.line_to(cx + bw / 2.0, u_bot + 0.06 * k);
+        let _ = cr.stroke();
+    }
+
     fn paint_theme_menu(&self, cr: &mut Canvas, bar: &BarLayout) {
         if !self.theme_menu_open || bar.theme_menu_rect.w <= 0.0 {
             return;
@@ -1956,6 +2215,60 @@ impl State {
 
         // Draw 12 theme cards
         let fs = 0.24 * k;
+        // Prediction on/off toggle (top row)
+        {
+            let pr = &bar.pred_toggle_rect;
+            let pr_hov = self.inside && pr.contains(self.px as f64, self.py as f64);
+            let active = self.prediction;
+            let (bg, fg) = if active {
+                (self.theme.on_bg, self.theme.accent)
+            } else if pr_hov {
+                (self.theme.key_hov, self.theme.keytxt)
+            } else {
+                (self.theme.key_mod, self.theme.modtxt)
+            };
+            cr.new_path();
+            rrect(cr, pr.x, pr.y, pr.w, pr.h, 5.0);
+            set_src(cr, bg);
+            let _ = cr.fill();
+            if active {
+                cr.new_path();
+                rrect(cr, pr.x + 0.5, pr.y + 0.5, pr.w - 1.0, pr.h - 1.0, 5.0);
+                set_src(cr, self.theme.accent);
+                cr.set_line_width(1.0);
+                let _ = cr.stroke();
+            }
+            cr.select_font_face(FONT, 0, if active { 1 } else { 0 });
+            self.draw_left(cr, "Word prediction", pr.x + 10.0, pr.y + pr.h / 2.0, fs, fg);
+            self.draw_centered(cr, if active { "on" } else { "off" }, pr.x + pr.w - 16.0, pr.y + pr.h / 2.0, fs * 0.9, fg);
+        }
+        // Tab accepts-prediction toggle (second row)
+        {
+            let tr = &bar.tab_toggle_rect;
+            let tr_hov = self.inside && tr.contains(self.px as f64, self.py as f64);
+            let active = self.tab_accepts_prediction;
+            let (bg, fg) = if active {
+                (self.theme.on_bg, self.theme.accent)
+            } else if tr_hov {
+                (self.theme.key_hov, self.theme.keytxt)
+            } else {
+                (self.theme.key_mod, self.theme.modtxt)
+            };
+            cr.new_path();
+            rrect(cr, tr.x, tr.y, tr.w, tr.h, 5.0);
+            set_src(cr, bg);
+            let _ = cr.fill();
+            if active {
+                cr.new_path();
+                rrect(cr, tr.x + 0.5, tr.y + 0.5, tr.w - 1.0, tr.h - 1.0, 5.0);
+                set_src(cr, self.theme.accent);
+                cr.set_line_width(1.0);
+                let _ = cr.stroke();
+            }
+            cr.select_font_face(FONT, 0, if active { 1 } else { 0 });
+            self.draw_left(cr, "Tab accepts prediction", tr.x + 10.0, tr.y + tr.h / 2.0, fs, fg);
+            self.draw_centered(cr, if active { "on" } else { "off" }, tr.x + tr.w - 16.0, tr.y + tr.h / 2.0, fs * 0.9, fg);
+        }
         for i in 0..12 {
             let item = &bar.theme_item_rects[i];
             let t = &THEMES[i];
@@ -2348,6 +2661,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, _wparam: WPARAM, lparam
             state.handle_repeat();
             state.handle_flash();
             state.handle_hold();
+            state.handle_dictation();
             state.backend.pump();
             if state.quit {
                 let _ = DestroyWindow(hwnd);
@@ -2430,6 +2744,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, _wparam: WPARAM, lparam
             PostQuitMessage(0);
             LRESULT(0)
         }
+        WM_SETCURSOR => {
+            unsafe {
+                if let Ok(c) = LoadCursorW(None, IDC_ARROW) {
+                    SetCursor(Some(c));
+                    return LRESULT(1);
+                }
+            }
+            DefWindowProcW(hwnd, msg, _wparam, lparam)
+        }
         _ => DefWindowProcW(hwnd, msg, _wparam, lparam),
     }
 }
@@ -2462,6 +2785,7 @@ pub fn run(backend: Box<dyn Backend>) -> i32 {
         style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(wnd_proc),
         hInstance: HINSTANCE(hinst.0),
+        hCursor: unsafe { LoadCursorW(None, IDC_ARROW).unwrap_or_default() },
         lpszClassName: PCWSTR::from_raw(class_name.as_ptr()),
         ..Default::default()
     };
@@ -2547,6 +2871,7 @@ mod tests {
             theme: "Nord".to_string(),
             layout: "65%+Num".to_string(),
             tab_accepts_prediction: true,
+            prediction: false,
         };
 
         let json = serde_json::to_string_pretty(&cfg).unwrap();
@@ -2560,6 +2885,7 @@ mod tests {
         assert_eq!(loaded.theme, "Nord");
         assert_eq!(loaded.layout, "65%+Num");
         assert!(loaded.tab_accepts_prediction);
+        assert!(!loaded.prediction);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2669,6 +2995,89 @@ mod tests {
         let h = (state.rsz_h + (pt2.y - state.grab_sy)).max(MIN_H);
         assert_eq!(w, 650);
         assert_eq!(h, 330);
+    }
+
+    #[test]
+    fn test_alt_key_momentary_tap() {
+        let backend = Box::new(MockBackend { events: Vec::new() });
+        let mut state = State::new(backend);
+        state.width = 800;
+        state.height = 300;
+
+        // Locate Alt key in 65% layout
+        let mut alt_idx = None;
+        for (r, row) in state.layout().rows.iter().enumerate() {
+            for (k, key) in row.keys.iter().enumerate() {
+                if key.code == key::KEY_LEFTALT {
+                    alt_idx = Some(r * 100 + k);
+                    break;
+                }
+            }
+        }
+        let alt_k = alt_idx.expect("Alt key should exist in 65% layout");
+
+        // Simulate click on Alt key
+        let (bx, by, bw, bh) = state.key_rect(alt_k / 100, alt_k % 100);
+        state.px = (bx + bw / 2.0) as i32;
+        state.py = (by + bh / 2.0) as i32;
+        state.on_button(true);
+
+        // Alt key must inject press + release immediately (not latch)
+        assert_eq!(state.mods.state(MOD_ALT), ModKeyState::Off, "Alt key should not latch modifier state");
+        assert_eq!(state.pressed, alt_k as i32);
+
+        // Release button
+        state.on_button(false);
+        assert_eq!(state.flash_key, alt_k as i32);
+        assert_eq!(state.pressed, -1);
+    }
+
+    #[test]
+    fn test_prediction_toggle_and_clear() {
+        let dir = std::env::temp_dir().join(format!("osk-test-pred-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+        unsafe {
+            std::env::set_var("OSK_CONFIG", &path);
+        }
+        let backend = Box::new(MockBackend { events: Vec::new() });
+        let mut state = State::new(backend);
+        assert!(state.prediction);
+
+        // Feed some letters into predictor
+        state.predictor.char('h');
+        state.predictor.char('e');
+        state.predictor.char('l');
+        assert!(!state.predictor.suggestions().is_empty());
+
+        // Toggle prediction off
+        state.theme_menu_open = true;
+        state.pred_toggle_rect = Rect { x: 10.0, y: 10.0, w: 100.0, h: 30.0, idx: 0 };
+        state.px = 20;
+        state.py = 20;
+        state.on_button(true);
+
+        assert!(!state.prediction, "Prediction should toggle to false");
+        assert_eq!(state.predictor.partial(), "", "Partial buffer should be cleared on toggle off");
+        let mut canvas = Canvas::new_bitmap(800, 300).unwrap();
+        let bar = state.measure_bar(&mut canvas);
+        assert_eq!(bar.n_sugg, 0, "No suggestions should be shown when prediction is toggled off");
+
+        // Clear active and learned words
+        state.predictor.learn_word("customword", 1);
+        assert!(!state.predictor.learned_words().is_empty());
+
+        state.dict_menu_open = true;
+        state.dict_clear_rect = Rect { x: 10.0, y: 50.0, w: 100.0, h: 30.0, idx: 0 };
+        state.px = 20;
+        state.py = 60;
+        state.on_button(true);
+
+        assert!(state.predictor.learned_words().is_empty(), "Learned words should be wiped on clear");
+        unsafe {
+            std::env::remove_var("OSK_CONFIG");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
