@@ -34,7 +34,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use osk_core::controller::{Clicked, Controller, ControllerConfig};
 use osk_core::interaction::{self, Event as IEvent, Interaction};
-use osk_core::key::{Key, Layout};
+use osk_core::key::{key, Click, Key, KeyKind, Layout};
 use osk_core::layout::ALL_LAYOUTS;
 use osk_core::metrics::Metrics;
 use osk_core::neural::NeuralEngine;
@@ -229,6 +229,18 @@ pub struct State {
     #[cfg(feature = "dictation")]
     dict_frame_due: u64,
     quit: bool,
+}
+
+/// Alt latches like Ctrl on Windows. The shared layouts make it a
+/// momentary tap, but a lone Alt press+release opens the focused app's
+/// menu bar (KeyTips, accelerator underlines) and leaves it showing.
+fn windows_click(mut k: Key) -> Key {
+    if let KeyKind::Inject { code, click } = &mut k.kind {
+        if *click == Click::Momentary && matches!(code.get(), key::KEY_LEFTALT | key::KEY_RIGHTALT) {
+            *click = Click::Latch;
+        }
+    }
+    k
 }
 
 impl State {
@@ -774,7 +786,7 @@ impl State {
             self.on_mic();
             return;
         }
-        let key = *self.key_of(k);
+        let key = windows_click(*self.key_of(k));
         // All keyboard logic lives in the controller.
         let mut sink = BackendSink {
             b: self.backend.as_mut(),
@@ -1231,17 +1243,33 @@ mod tests {
     }
 
     #[test]
-    fn win_and_alt_are_momentary_taps_not_latches() {
-        for (code, slot) in [(key::KEY_LEFTMETA, MOD_META), (key::KEY_LEFTALT, MOD_ALT)] {
-            let mut s = state();
-            let idx = point_at(&mut s, code);
-            s.on_button(true);
-            assert_eq!(s.ctl.mods().state(slot), ModKeyState::Off, "code {code} must not latch");
-            assert!(matches!(s.interaction, Interaction::Press { key, .. } if key == idx));
-            s.on_button(false);
-            assert_eq!(s.flash_key, idx as i32);
-            assert_eq!(s.interaction, Interaction::Idle);
-        }
+    fn win_is_a_momentary_tap_not_a_latch() {
+        let mut s = state();
+        let idx = point_at(&mut s, key::KEY_LEFTMETA);
+        s.on_button(true);
+        assert_eq!(s.ctl.mods().state(MOD_META), ModKeyState::Off, "Win must not latch");
+        assert!(matches!(s.interaction, Interaction::Press { key, .. } if key == idx));
+        s.on_button(false);
+        assert_eq!(s.flash_key, idx as i32);
+        assert_eq!(s.interaction, Interaction::Idle);
+    }
+
+    #[test]
+    fn alt_latches_instead_of_tapping_alone() {
+        // A lone Alt tap would open the focused app's menu bar.
+        let presses = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut s = state_counting(presses.clone());
+        point_at(&mut s, key::KEY_LEFTALT);
+        s.on_button(true);
+        s.on_button(false);
+        assert_eq!(s.ctl.mods().state(MOD_ALT), ModKeyState::Latched);
+        assert_eq!(presses.get(), 0, "no lone Alt reaches the app");
+        // The next key carries Alt, then the latch clears.
+        point_at(&mut s, key::KEY_TAB);
+        s.on_button(true);
+        s.on_button(false);
+        assert_eq!(presses.get(), 2, "Alt+Tab");
+        assert_eq!(s.ctl.mods().state(MOD_ALT), ModKeyState::Off);
     }
 
     #[test]
