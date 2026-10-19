@@ -766,6 +766,14 @@ impl State {
         let Some(k) = self.key_at(self.px, self.py) else {
             return;
         };
+        // While dictation records, any key stops it and transcribes,
+        // so the hand never travels back to the small mic button. The
+        // key is the stop gesture only; nothing is typed.
+        #[cfg(feature = "dictation")]
+        if self.dict_state == DictState::Recording {
+            self.on_mic();
+            return;
+        }
         let key = *self.key_of(k);
         // All keyboard logic lives in the controller.
         let mut sink = BackendSink {
@@ -1175,7 +1183,8 @@ mod tests {
     use osk_core::key::key;
     use osk_core::mods::{ModKeyState, MOD_ALT, MOD_META};
 
-    struct MockBackend;
+    /// Counts the key presses it is asked to inject.
+    struct MockBackend(std::rc::Rc<std::cell::Cell<usize>>);
 
     impl Backend for MockBackend {
         fn name(&self) -> &'static str {
@@ -1184,14 +1193,20 @@ mod tests {
         fn init(&mut self) -> Result<(), String> {
             Ok(())
         }
-        fn press(&mut self, _code: u16) {}
+        fn press(&mut self, _code: u16) {
+            self.0.set(self.0.get() + 1);
+        }
         fn release(&mut self, _code: u16) {}
         fn pump(&mut self) {}
         fn destroy(&mut self) {}
     }
 
     fn state() -> State {
-        let mut s = State::new(Box::new(MockBackend), None);
+        state_counting(Default::default())
+    }
+
+    fn state_counting(presses: std::rc::Rc<std::cell::Cell<usize>>) -> State {
+        let mut s = State::new(Box::new(MockBackend(presses)), None);
         s.width = 800;
         s.height = 300;
         s
@@ -1252,6 +1267,24 @@ mod tests {
         s.drag_to((780, 440));
         let (w, h) = Metrics::clamp_size(630, 320, s.grid_cols, s.layout().rows.len());
         assert_eq!((s.width, s.height), (w.max(MIN_W), h.max(MIN_H)));
+    }
+
+    #[cfg(feature = "dictation")]
+    #[test]
+    fn a_key_stops_recording_instead_of_typing() {
+        let presses = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut s = state_counting(presses.clone());
+        s.dict_state = DictState::Recording;
+        point_at(&mut s, key::KEY_A);
+        s.on_button(true);
+        s.on_button(false);
+        assert!(s.dict_state != DictState::Recording, "the key ended the recording");
+        assert_eq!(presses.get(), 0, "the key typed nothing");
+        assert_eq!(s.interaction, Interaction::Idle);
+        // Once it is over, the same key types again.
+        point_at(&mut s, key::KEY_A);
+        s.on_button(true);
+        assert_eq!(presses.get(), 1);
     }
 
     #[test]
