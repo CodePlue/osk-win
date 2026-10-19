@@ -12,9 +12,10 @@
 //! takes focus and injected keys land in the window the user focused.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicIsize, Ordering};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, InvalidateRect, UpdateWindow, PAINTSTRUCT,
 };
@@ -23,8 +24,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
-    KillTimer, LoadCursorW, PostQuitMessage, RegisterClassExW, SetCursor, SetTimer, SetWindowPos,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
+    GetMessageW, GetWindowRect, KillTimer, PostMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
+    HHOOK, MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_APP, WM_MBUTTONUP, WM_RBUTTONUP, LoadCursorW, PostQuitMessage, RegisterClassExW, SetCursor, SetTimer, SetWindowPos,
     ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, IDC_ARROW, IDC_SIZENWSE, MSG,
     SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE, WM_DESTROY, WM_ERASEBKGND,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN,
@@ -35,7 +37,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use osk_core::controller::{Clicked, Controller, ControllerConfig};
 use osk_core::interaction::{self, Event as IEvent, Interaction};
 use osk_core::key::{key, Click, Key, KeyKind, Layout};
-use osk_core::mods::MOD_ALT;
+use osk_core::mods::{ModKeyState, DOUBLE_CLICK_MS, MOD_ALT};
 use osk_core::layout::ALL_LAYOUTS;
 use osk_core::metrics::Metrics;
 use osk_core::neural::NeuralEngine;
@@ -202,6 +204,8 @@ pub struct State {
     flash_until: u64,
     /// The Alt key this osk holds down in Windows, if any.
     alt_down: Option<u16>,
+    /// The mouse hook watching for a click elsewhere while Alt is latched.
+    mouse_hook: Option<HHOOK>,
     grid_cols: i32,
     handle_hover: bool,
     handle_anim_since: Option<u64>,
@@ -273,6 +277,26 @@ impl KeySink for AltSink<'_> {
     }
 }
 
+/// Posted by [`mouse_hook`] when a mouse button comes up outside the osk.
+const WM_CLICK_ELSEWHERE: u32 = WM_APP + 1;
+const HC_ACTION: i32 = 0;
+static OSK_HWND: AtomicIsize = AtomicIsize::new(0);
+
+unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == HC_ACTION && matches!(wparam.0 as u32, WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP) {
+        let pt = unsafe { (*(lparam.0 as *const MSLLHOOKSTRUCT)).pt };
+        let hwnd = HWND(OSK_HWND.load(Ordering::Relaxed) as *mut _);
+        let mut r = RECT::default();
+        let inside = unsafe { GetWindowRect(hwnd, &mut r) }.is_ok()
+            && (r.left..r.right).contains(&pt.x)
+            && (r.top..r.bottom).contains(&pt.y);
+        if !inside {
+            let _ = unsafe { PostMessageW(Some(hwnd), WM_CLICK_ELSEWHERE, WPARAM(0), LPARAM(0)) };
+        }
+    }
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
 impl State {
     pub fn new(backend: Box<dyn Backend>, neural: Option<NeuralEngine>) -> Self {
         let config = PersistentConfig::load();
@@ -316,6 +340,7 @@ impl State {
             flash_key: -1,
             flash_until: 0,
             alt_down: None,
+            mouse_hook: None,
             grid_cols,
             handle_hover: false,
             handle_anim_since: None,
@@ -587,7 +612,43 @@ impl State {
     fn sync_alt(&mut self) {
         let mods = self.ctl.mods();
         let want = mods.state(MOD_ALT).is_active().then(|| mods.code(MOD_ALT));
+        let latched = mods.state(MOD_ALT) == ModKeyState::Latched;
         self.set_alt(want);
+        self.watch_mouse(latched);
+    }
+
+    /// Watch for a mouse click in another window: it is the "next key" a
+    /// latched Alt applies to, as in the Windows osk (Alt+click).
+    fn watch_mouse(&mut self, on: bool) {
+        if on == self.mouse_hook.is_some() || self.hwnd == 0 {
+            return;
+        }
+        if let Some(hook) = self.mouse_hook.take() {
+            let _ = unsafe { UnhookWindowsHookEx(hook) };
+            return;
+        }
+        OSK_HWND.store(self.hwnd, Ordering::Relaxed);
+        match unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), None, 0) } {
+            Ok(hook) => self.mouse_hook = Some(hook),
+            Err(e) => warn!("osk: no mouse hook, Alt+click keeps Alt down: {e}"),
+        }
+    }
+
+    /// A mouse click elsewhere finished under a latched Alt: release it.
+    fn on_click_elsewhere(&mut self) {
+        let mods = self.ctl.mods();
+        if mods.state(MOD_ALT) != ModKeyState::Latched {
+            return;
+        }
+        // A click outside the double-click window takes the latch to off.
+        let alt = windows_click(Key::momentary("alt", mods.code(MOD_ALT), 25));
+        let mut sink = AltSink {
+            b: self.backend.as_mut(),
+            alt: &mut self.alt_down,
+        };
+        self.ctl.click_key(&alt, now_ms() + DOUBLE_CLICK_MS, &mut sink);
+        self.sync_alt();
+        self.request_redraw();
     }
 
     fn set_alt(&mut self, want: Option<u16>) {
@@ -1110,6 +1171,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let _ = unsafe { EndPaint(hwnd, &ps) };
             LRESULT(0)
         }
+        WM_CLICK_ELSEWHERE => {
+            state.on_click_elsewhere();
+            LRESULT(0)
+        }
         WM_TIMER => {
             state.tick();
             LRESULT(0)
@@ -1252,6 +1317,7 @@ pub fn run(backend: Box<dyn Backend>, neural: Option<NeuralEngine>) -> i32 {
     state.save_config();
     state.save_history();
     // Never leave Alt stuck down in Windows.
+    state.watch_mouse(false);
     state.set_alt(None);
     state.backend.destroy();
     0
@@ -1371,6 +1437,32 @@ mod tests {
         click(&mut s, alt);
         assert_eq!(*events.borrow(), [(alt, true), (alt, false)]);
         assert_eq!(s.alt_down, None);
+    }
+
+    #[test]
+    fn a_click_elsewhere_releases_a_latched_alt() {
+        let events = Events::default();
+        let mut s = state_logging(events.clone());
+        let alt = key::KEY_LEFTALT;
+        click(&mut s, alt);
+        s.on_click_elsewhere();
+        assert_eq!(*events.borrow(), [(alt, true), (alt, false)]);
+        assert_eq!(s.ctl.mods().state(MOD_ALT), ModKeyState::Off);
+        // The release is no click on the key: a new click latches again.
+        click(&mut s, alt);
+        assert_eq!(s.ctl.mods().state(MOD_ALT), ModKeyState::Latched);
+    }
+
+    #[test]
+    fn a_click_elsewhere_keeps_a_locked_alt_down() {
+        let events = Events::default();
+        let mut s = state_logging(events.clone());
+        let alt = key::KEY_LEFTALT;
+        click(&mut s, alt);
+        click(&mut s, alt);
+        s.on_click_elsewhere();
+        assert_eq!(s.ctl.mods().state(MOD_ALT), ModKeyState::Locked);
+        assert_eq!(s.alt_down, Some(alt));
     }
 
     #[test]
