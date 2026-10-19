@@ -23,7 +23,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetMessageW, GetSystemMetrics, KBDLLHOOKSTRUCT, LLKHF_UP, PeekMessageW, PM_REMOVE,
     RegisterClassW, SetForegroundWindow, SetWindowsHookExW, ShowWindow, SW_SHOW,
     TranslateMessage, UnhookWindowsHookEx, WNDCLASSW, WH_KEYBOARD_LL, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_CHAR, WM_CLOSE, WM_KEYDOWN, SM_CXSCREEN, SM_CYSCREEN,
+    WINDOW_STYLE, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP, SM_CXSCREEN, SM_CYSCREEN,
 };
 
 const CLASS: &str = "oskwin-verify";
@@ -79,6 +79,9 @@ unsafe extern "system" fn wnd_proc(
             char::from_u32(wparam.0 as u32).unwrap_or('?')
         ),
         WM_KEYDOWN => println!("keydown vk={:02x}", wparam.0),
+        // Alt and keys pressed under it arrive as system keys.
+        WM_SYSKEYDOWN => println!("syskeydown vk={:02x}", wparam.0),
+        WM_SYSKEYUP => println!("syskeyup vk={:02x}", wparam.0),
         WM_CLOSE => {
             let _ = DestroyWindow(hwnd);
             return LRESULT(0);

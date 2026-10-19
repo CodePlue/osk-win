@@ -35,14 +35,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use osk_core::controller::{Clicked, Controller, ControllerConfig};
 use osk_core::interaction::{self, Event as IEvent, Interaction};
 use osk_core::key::{key, Click, Key, KeyKind, Layout};
+use osk_core::mods::MOD_ALT;
 use osk_core::layout::ALL_LAYOUTS;
 use osk_core::metrics::Metrics;
 use osk_core::neural::NeuralEngine;
 use osk_core::predict::Predictor;
 #[cfg(feature = "dictation")]
-use osk_core::typekey::type_text;
+use osk_core::typekey::{type_text, KeySink};
 
-use crate::backend::{Backend, BackendSink};
+use crate::backend::Backend;
 use crate::cairo::{Context, FontSlant, FontWeight, Format, ImageSurface};
 use crate::history::{load_history, save_history_if_dirty};
 #[cfg(feature = "dictation")]
@@ -199,6 +200,8 @@ pub struct State {
     drag_origin: (i32, i32),
     flash_key: i32,
     flash_until: u64,
+    /// The Alt key this osk holds down in Windows, if any.
+    alt_down: Option<u16>,
     grid_cols: i32,
     handle_hover: bool,
     handle_anim_since: Option<u64>,
@@ -231,16 +234,43 @@ pub struct State {
     quit: bool,
 }
 
-/// Alt latches like Ctrl on Windows. The shared layouts make it a
-/// momentary tap, but a lone Alt press+release opens the focused app's
-/// menu bar (KeyTips, accelerator underlines) and leaves it showing.
+/// Alt latches like Ctrl on Windows, and [`State::sync_alt`] holds it
+/// down while latched, as the Windows osk does. The shared layouts make
+/// it a momentary tap, but a lone Alt press+release opens the focused
+/// app's menu bar (KeyTips, accelerator underlines) and leaves it showing.
 fn windows_click(mut k: Key) -> Key {
     if let KeyKind::Inject { code, click } = &mut k.kind {
-        if *click == Click::Momentary && matches!(code.get(), key::KEY_LEFTALT | key::KEY_RIGHTALT) {
+        if *click == Click::Momentary && is_alt(code.get()) {
             *click = Click::Latch;
         }
     }
     k
+}
+
+fn is_alt(code: u16) -> bool {
+    matches!(code, key::KEY_LEFTALT | key::KEY_RIGHTALT)
+}
+
+/// Injects through the backend, tracking whether Alt is down: a tap
+/// under a latched Alt sends its own Alt press and release.
+struct AltSink<'a> {
+    b: &'a mut dyn Backend,
+    alt: &'a mut Option<u16>,
+}
+
+impl KeySink for AltSink<'_> {
+    fn press(&mut self, code: u16) {
+        if is_alt(code) {
+            *self.alt = Some(code);
+        }
+        self.b.press(code);
+    }
+    fn release(&mut self, code: u16) {
+        if is_alt(code) {
+            *self.alt = None;
+        }
+        self.b.release(code);
+    }
 }
 
 impl State {
@@ -285,6 +315,7 @@ impl State {
             drag_origin: (0, 0),
             flash_key: -1,
             flash_until: 0,
+            alt_down: None,
             grid_cols,
             handle_hover: false,
             handle_anim_since: None,
@@ -551,21 +582,49 @@ impl State {
 
     // ---- input ----
 
+    /// Hold Alt down in Windows exactly while the controller has it
+    /// latched or locked, so other apps see it held (Alt+click, Alt+drag).
+    fn sync_alt(&mut self) {
+        let mods = self.ctl.mods();
+        let want = mods.state(MOD_ALT).is_active().then(|| mods.code(MOD_ALT));
+        self.set_alt(want);
+    }
+
+    fn set_alt(&mut self, want: Option<u16>) {
+        if want == self.alt_down {
+            return;
+        }
+        let mut sink = AltSink {
+            b: self.backend.as_mut(),
+            alt: &mut self.alt_down,
+        };
+        if let Some(code) = *sink.alt {
+            sink.release(code);
+        }
+        if let Some(code) = want {
+            sink.press(code);
+        }
+    }
+
     fn tap_key(&mut self, idx: usize) {
         let k = *self.key_of(idx);
-        let mut sink = BackendSink {
+        let mut sink = AltSink {
             b: self.backend.as_mut(),
+            alt: &mut self.alt_down,
         };
         self.ctl.tap_key(&k, &mut sink);
+        self.sync_alt();
         self.redraw_now();
         self.save_history();
     }
 
     fn click_suggestion(&mut self, idx: usize) {
-        let mut sink = BackendSink {
+        let mut sink = AltSink {
             b: self.backend.as_mut(),
+            alt: &mut self.alt_down,
         };
         self.ctl.commit_suggestion(idx, &mut sink).ok();
+        self.sync_alt();
         self.save_history();
         self.request_redraw();
     }
@@ -788,10 +847,13 @@ impl State {
         }
         let key = windows_click(*self.key_of(k));
         // All keyboard logic lives in the controller.
-        let mut sink = BackendSink {
+        let mut sink = AltSink {
             b: self.backend.as_mut(),
+            alt: &mut self.alt_down,
         };
-        match self.ctl.click_key(&key, now_ms(), &mut sink) {
+        let clicked = self.ctl.click_key(&key, now_ms(), &mut sink);
+        self.sync_alt();
+        match clicked {
             Clicked::Inert => {}
             Clicked::Momentary => {
                 self.interact(IEvent::Press {
@@ -891,8 +953,9 @@ impl State {
                 if let Some(map) = self.ctl.charmap() {
                     let pause = || std::thread::sleep(std::time::Duration::from_millis(20));
                     if let Err(e) = type_text(
-                        &mut BackendSink {
+                        &mut AltSink {
                             b: self.backend.as_mut(),
+                            alt: &mut self.alt_down,
                         },
                         map,
                         &text,
@@ -900,6 +963,7 @@ impl State {
                     ) {
                         warn!("[dictate] failed to type: {e:?}");
                     }
+                    self.sync_alt();
                 }
             }
             Ok(_) => {}
@@ -943,10 +1007,12 @@ impl State {
             self.flash_key = -1;
             self.request_redraw();
         }
-        let mut sink = BackendSink {
+        let mut sink = AltSink {
             b: self.backend.as_mut(),
+            alt: &mut self.alt_down,
         };
         self.ctl.tick(now, &mut sink);
+        self.sync_alt();
         if self.handle_anim_since.is_some_and(|s| now.saturating_sub(s) <= render::HANDLE_ANIM_MS + ANIM_FRAME_MS) {
             self.request_redraw();
         }
@@ -1185,6 +1251,8 @@ pub fn run(backend: Box<dyn Backend>, neural: Option<NeuralEngine>) -> i32 {
     unsafe { STATE_PTR = std::ptr::null_mut() };
     state.save_config();
     state.save_history();
+    // Never leave Alt stuck down in Windows.
+    state.set_alt(None);
     state.backend.destroy();
     0
 }
@@ -1193,10 +1261,13 @@ pub fn run(backend: Box<dyn Backend>, neural: Option<NeuralEngine>) -> i32 {
 mod tests {
     use super::*;
     use osk_core::key::key;
-    use osk_core::mods::{ModKeyState, MOD_ALT, MOD_META};
+    use osk_core::mods::{ModKeyState, DOUBLE_CLICK_MS, MOD_META};
 
-    /// Counts the key presses it is asked to inject.
-    struct MockBackend(std::rc::Rc<std::cell::Cell<usize>>);
+    /// Counts the key presses it is asked to inject, and logs every
+    /// event as (code, down).
+    struct MockBackend(std::rc::Rc<std::cell::Cell<usize>>, Events);
+
+    type Events = std::rc::Rc<std::cell::RefCell<Vec<(u16, bool)>>>;
 
     impl Backend for MockBackend {
         fn name(&self) -> &'static str {
@@ -1205,10 +1276,13 @@ mod tests {
         fn init(&mut self) -> Result<(), String> {
             Ok(())
         }
-        fn press(&mut self, _code: u16) {
+        fn press(&mut self, code: u16) {
             self.0.set(self.0.get() + 1);
+            self.1.borrow_mut().push((code, true));
         }
-        fn release(&mut self, _code: u16) {}
+        fn release(&mut self, code: u16) {
+            self.1.borrow_mut().push((code, false));
+        }
         fn pump(&mut self) {}
         fn destroy(&mut self) {}
     }
@@ -1218,7 +1292,15 @@ mod tests {
     }
 
     fn state_counting(presses: std::rc::Rc<std::cell::Cell<usize>>) -> State {
-        let mut s = State::new(Box::new(MockBackend(presses)), None);
+        state_with(presses, Default::default())
+    }
+
+    fn state_logging(events: Events) -> State {
+        state_with(Default::default(), events)
+    }
+
+    fn state_with(presses: std::rc::Rc<std::cell::Cell<usize>>, events: Events) -> State {
+        let mut s = State::new(Box::new(MockBackend(presses, events)), None);
         s.width = 800;
         s.height = 300;
         s
@@ -1254,22 +1336,54 @@ mod tests {
         assert_eq!(s.interaction, Interaction::Idle);
     }
 
+    fn click(s: &mut State, code: u16) {
+        point_at(s, code);
+        s.on_button(true);
+        s.on_button(false);
+    }
+
     #[test]
-    fn alt_latches_instead_of_tapping_alone() {
-        // A lone Alt tap would open the focused app's menu bar.
-        let presses = std::rc::Rc::new(std::cell::Cell::new(0));
-        let mut s = state_counting(presses.clone());
-        point_at(&mut s, key::KEY_LEFTALT);
-        s.on_button(true);
-        s.on_button(false);
+    fn alt_is_held_down_until_the_next_key() {
+        // Like the Windows osk: Alt goes down at once and stays down,
+        // never a lone tap (that would open the focused app's menu bar).
+        let events = Events::default();
+        let mut s = state_logging(events.clone());
+        let alt = key::KEY_LEFTALT;
+        click(&mut s, alt);
         assert_eq!(s.ctl.mods().state(MOD_ALT), ModKeyState::Latched);
-        assert_eq!(presses.get(), 0, "no lone Alt reaches the app");
-        // The next key carries Alt, then the latch clears.
-        point_at(&mut s, key::KEY_TAB);
-        s.on_button(true);
-        s.on_button(false);
-        assert_eq!(presses.get(), 2, "Alt+Tab");
+        assert_eq!(*events.borrow(), [(alt, true)], "Alt is down and stays down");
+        // The next key goes out under Alt, which is then released.
+        click(&mut s, key::KEY_TAB);
         assert_eq!(s.ctl.mods().state(MOD_ALT), ModKeyState::Off);
+        let ev = events.borrow();
+        assert!(ev.contains(&(key::KEY_TAB, true)));
+        assert_eq!(ev.last(), Some(&(alt, false)), "Alt released after the key");
+        assert_eq!(s.alt_down, None);
+    }
+
+    #[test]
+    fn clicking_alt_again_releases_it() {
+        let events = Events::default();
+        let mut s = state_logging(events.clone());
+        let alt = key::KEY_LEFTALT;
+        click(&mut s, alt);
+        std::thread::sleep(std::time::Duration::from_millis(DOUBLE_CLICK_MS + 50));
+        click(&mut s, alt);
+        assert_eq!(*events.borrow(), [(alt, true), (alt, false)]);
+        assert_eq!(s.alt_down, None);
+    }
+
+    #[test]
+    fn a_locked_alt_stays_down_across_keys() {
+        let events = Events::default();
+        let mut s = state_logging(events.clone());
+        let alt = key::KEY_LEFTALT;
+        click(&mut s, alt);
+        click(&mut s, alt);
+        assert_eq!(s.ctl.mods().state(MOD_ALT), ModKeyState::Locked);
+        click(&mut s, key::KEY_TAB);
+        assert_eq!(s.alt_down, Some(alt), "still held after the key");
+        assert_eq!(events.borrow().last(), Some(&(alt, true)));
     }
 
     #[test]
