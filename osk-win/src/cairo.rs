@@ -1,23 +1,24 @@
-//! The subset of the cairo API that `render.rs` draws with, on GDI.
+//! The subset of the cairo API that `render.rs` draws with, powered by
+//! tiny-skia and fontdue with a GDI backbuffer for blitting to the window HDC.
 //!
-//! `render.rs` is copied unchanged from the Linux osk, where it paints
-//! with cairo; this module gives it the same names and semantics on a
-//! GDI memory DC, so a sync stays a plain copy. Paths map onto GDI
-//! paths (arcs flattened to line segments), fills and strokes onto
-//! `FillPath` and `StrokePath`, a clip onto `SelectClipPath` with
-//! `RGN_AND` (it narrows the current clip, as cairo's does), and text
-//! is placed by its baseline, as cairo places it.
-//!
-//! GDI draws opaque and without anti-aliasing: alpha and the compositing
-//! operator are accepted and ignored.
+//! Vector paths (arcs, rounded rects, lines, strokes, fills, clips) and text
+//! are rendered with subpixel anti-aliasing and alpha blending into a tiny-skia
+//! `Pixmap`. When `blit_to_hdc` is called, the pixels are transferred to the
+//! GDI DIB section and blitted to the window device context.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::f64::consts::PI;
 use std::ffi::c_void;
 use std::io::Write;
 use std::ptr;
 use std::rc::Rc;
+use std::sync::LazyLock;
+
+use fontdue::{Font, FontSettings};
+use tiny_skia::{
+    BlendMode, Color, FillRule, FilterQuality, LineCap as SkiaLineCap, LineJoin,
+    Mask, Paint, PathBuilder, Pixmap, PixmapPaint, Rect, Stroke, Transform,
+};
 
 type Hdc = *mut c_void;
 type Hgdiobj = *mut c_void;
@@ -37,59 +38,7 @@ struct BitmapInfoHeader {
     clr_important: u32,
 }
 
-#[repr(C)]
-struct GdiPoint {
-    x: i32,
-    y: i32,
-}
-
-#[repr(C)]
-struct LogBrush {
-    style: u32,
-    color: u32,
-    hatch: usize,
-}
-
-#[repr(C)]
-#[derive(Default)]
-struct TextMetricW {
-    height: i32,
-    ascent: i32,
-    descent: i32,
-    internal_leading: i32,
-    external_leading: i32,
-    ave_char_width: i32,
-    max_char_width: i32,
-    weight: i32,
-    overhang: i32,
-    digitized_aspect_x: i32,
-    digitized_aspect_y: i32,
-    first_char: u16,
-    last_char: u16,
-    default_char: u16,
-    break_char: u16,
-    italic: u8,
-    underlined: u8,
-    struck_out: u8,
-    pitch_and_family: u8,
-    char_set: u8,
-}
-
 const SRCCOPY: u32 = 0x00CC_0020;
-const TRANSPARENT: i32 = 1;
-const WINDING: i32 = 2;
-const RGN_AND: i32 = 1;
-const TA_BASELINE: u32 = 24;
-const BS_SOLID: u32 = 0;
-const PS_GEOMETRIC: u32 = 0x0001_0000;
-const PS_SOLID: u32 = 0;
-const PS_ENDCAP_ROUND: u32 = 0;
-const PS_ENDCAP_FLAT: u32 = 0x0000_0200;
-const PS_JOIN_ROUND: u32 = 0;
-const FW_NORMAL: i32 = 400;
-const FW_BOLD: i32 = 700;
-const DEFAULT_CHARSET: u32 = 1;
-const ANTIALIASED_QUALITY: u32 = 4;
 
 #[link(name = "gdi32")]
 extern "system" {
@@ -105,7 +54,6 @@ extern "system" {
     ) -> Hgdiobj;
     fn SelectObject(hdc: Hdc, obj: Hgdiobj) -> Hgdiobj;
     fn DeleteObject(obj: Hgdiobj) -> i32;
-    fn GetStockObject(i: i32) -> Hgdiobj;
     fn BitBlt(
         dst: Hdc,
         x: i32,
@@ -118,57 +66,19 @@ extern "system" {
         rop: u32,
     ) -> i32;
     fn GdiFlush() -> i32;
-    fn SetBkMode(hdc: Hdc, mode: i32) -> i32;
-    fn SetPolyFillMode(hdc: Hdc, mode: i32) -> i32;
-    fn SetTextAlign(hdc: Hdc, align: u32) -> u32;
-    fn SetTextColor(hdc: Hdc, color: u32) -> u32;
-    fn BeginPath(hdc: Hdc) -> i32;
-    fn EndPath(hdc: Hdc) -> i32;
-    fn AbortPath(hdc: Hdc) -> i32;
-    fn MoveToEx(hdc: Hdc, x: i32, y: i32, old: *mut GdiPoint) -> i32;
-    fn PolylineTo(hdc: Hdc, pts: *const GdiPoint, n: u32) -> i32;
-    fn CloseFigure(hdc: Hdc) -> i32;
-    fn FillPath(hdc: Hdc) -> i32;
-    fn StrokePath(hdc: Hdc) -> i32;
-    fn SelectClipPath(hdc: Hdc, mode: i32) -> i32;
-    fn SelectClipRgn(hdc: Hdc, rgn: Hgdiobj) -> i32;
-    fn SaveDC(hdc: Hdc) -> i32;
-    fn RestoreDC(hdc: Hdc, saved: i32) -> i32;
-    fn CreateSolidBrush(color: u32) -> Hgdiobj;
-    fn ExtCreatePen(style: u32, width: u32, brush: *const LogBrush, n: u32, styles: *const u32)
-        -> Hgdiobj;
-    fn CreateFontW(
-        height: i32,
-        width: i32,
-        escapement: i32,
-        orientation: i32,
-        weight: i32,
-        italic: u32,
-        underline: u32,
-        strikeout: u32,
-        charset: u32,
-        out_precision: u32,
-        clip_precision: u32,
-        quality: u32,
-        pitch_and_family: u32,
-        face: *const u16,
-    ) -> Hgdiobj;
-    fn TextOutW(hdc: Hdc, x: i32, y: i32, s: *const u16, n: i32) -> i32;
-    fn GetTextExtentPoint32W(hdc: Hdc, s: *const u16, n: i32, size: *mut GdiPoint) -> i32;
-    fn GetTextMetricsW(hdc: Hdc, tm: *mut TextMetricW) -> i32;
 }
 
-const NULL_PEN: i32 = 8;
-const NULL_BRUSH: i32 = 5;
+static EMBEDDED_FONT: &[u8] = include_bytes!("../assets/AdwaitaSans-Regular.ttf");
+static FONT: LazyLock<Font> = LazyLock::new(|| {
+    Font::from_bytes(EMBEDDED_FONT, FontSettings::default()).expect("invalid embedded font")
+});
 
-/// A failed GDI call. cairo's calls return `Result`; render.rs ignores
-/// most of them with `let _ =`.
 #[derive(Debug, Clone, Copy)]
 pub struct Error;
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("GDI drawing failed")
+        f.write_str("Drawing failed")
     }
 }
 
@@ -188,7 +98,7 @@ pub enum FontWeight {
     Bold,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Operator {
     Source,
     Over,
@@ -200,8 +110,6 @@ pub enum LineCap {
     Round,
 }
 
-/// Measured text, in the same frame cairo reports it: the bearings put
-/// the ink box relative to the baseline origin.
 #[derive(Clone, Copy, Debug)]
 pub struct TextExtents {
     width: f64,
@@ -224,27 +132,19 @@ impl TextExtents {
     }
 }
 
-/// The pixels and the DC they are selected into, plus the fonts made
-/// for that DC.
 struct Surface {
+    pixmap: RefCell<Pixmap>,
     dc: Hdc,
     bitmap: Hgdiobj,
     old_bitmap: Hgdiobj,
     pixels: *mut u8,
     w: i32,
     h: i32,
-    /// Fonts by (pixel height x 4, bold); a frame sets the size for
-    /// every label, and making a GDI font each time is slow.
-    fonts: RefCell<HashMap<(i32, bool), Hgdiobj>>,
 }
 
 impl Drop for Surface {
     fn drop(&mut self) {
         unsafe {
-            SelectObject(self.dc, GetStockObject(17 /* DEFAULT_GUI_FONT */));
-            for (_, f) in self.fonts.borrow_mut().drain() {
-                DeleteObject(f);
-            }
             SelectObject(self.dc, self.old_bitmap);
             DeleteObject(self.bitmap);
             DeleteDC(self.dc);
@@ -252,17 +152,17 @@ impl Drop for Surface {
     }
 }
 
-/// A 32-bit image, like cairo's ARGB32 image surface.
 #[derive(Clone)]
 pub struct ImageSurface(Rc<Surface>);
 
 impl ImageSurface {
     pub fn create(_format: Format, w: i32, h: i32) -> Result<Self, Error> {
         let (w, h) = (w.max(1), h.max(1));
+        let pixmap = Pixmap::new(w as u32, h as u32).ok_or(Error)?;
+
         let info = BitmapInfoHeader {
             size: std::mem::size_of::<BitmapInfoHeader>() as u32,
             width: w,
-            // Negative: rows top-down, like cairo's.
             height: -h,
             planes: 1,
             bit_count: 32,
@@ -274,8 +174,9 @@ impl ImageSurface {
             clr_important: 0,
         };
         let mut pixels: *mut c_void = ptr::null_mut();
-        let bitmap =
-            unsafe { CreateDIBSection(ptr::null_mut(), &info, 0, &mut pixels, ptr::null_mut(), 0) };
+        let bitmap = unsafe {
+            CreateDIBSection(ptr::null_mut(), &info, 0, &mut pixels, ptr::null_mut(), 0)
+        };
         if bitmap.is_null() || pixels.is_null() {
             return Err(Error);
         }
@@ -285,20 +186,15 @@ impl ImageSurface {
             return Err(Error);
         }
         let old_bitmap = unsafe { SelectObject(dc, bitmap) };
-        unsafe {
-            SetBkMode(dc, TRANSPARENT);
-            SetPolyFillMode(dc, WINDING);
-            SetTextAlign(dc, TA_BASELINE);
-        }
-        crate::gdip::ensure_embedded_font();
+
         Ok(Self(Rc::new(Surface {
+            pixmap: RefCell::new(pixmap),
             dc,
             bitmap,
             old_bitmap,
             pixels: pixels as *mut u8,
             w,
             h,
-            fonts: RefCell::new(HashMap::new()),
         })))
     }
 
@@ -311,60 +207,54 @@ impl ImageSurface {
     }
 
     pub fn flush(&self) {
+        let pm = self.0.pixmap.borrow();
+        let src = pm.data();
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut(self.0.pixels, (self.0.w * self.0.h * 4) as usize)
+        };
+        let (src_chunks, _) = src.as_chunks::<4>();
+        let (dst_chunks, _) = dst.as_chunks_mut::<4>();
+        for (s, d) in src_chunks.iter().zip(dst_chunks.iter_mut()) {
+            d[0] = s[2]; // B
+            d[1] = s[1]; // G
+            d[2] = s[0]; // R
+            d[3] = s[3]; // A
+        }
         unsafe { GdiFlush() };
     }
 
-    /// Copy the image onto a window's device context at (0, 0).
     pub fn blit_to_hdc(&self, hdc: *mut c_void) {
         self.flush();
         unsafe { BitBlt(hdc, 0, 0, self.0.w, self.0.h, self.0.dc, 0, 0, SRCCOPY) };
     }
 
-    /// Write the image as a PNG (8-bit RGB, stored deflate blocks).
     pub fn write_to_png<W: Write>(&self, out: &mut W) -> Result<(), Error> {
-        self.flush();
-        let (w, h) = (self.0.w as usize, self.0.h as usize);
-        let mut raw = Vec::with_capacity(h * (1 + 3 * w));
-        let pixels = unsafe { std::slice::from_raw_parts(self.0.pixels, w * h * 4) };
-        for row in pixels.chunks(w * 4) {
-            raw.push(0);
-            for px in row.chunks(4) {
-                raw.extend_from_slice(&[px[2], px[1], px[0]]);
-            }
-        }
-        png::write(out, w as u32, h as u32, &raw).map_err(|_| Error)
+        let pm = self.0.pixmap.borrow();
+        let png = pm.encode_png().map_err(|_| Error)?;
+        out.write_all(&png).map_err(|_| Error)
     }
 }
 
-/// One subpath in device pixels.
-#[derive(Default)]
-struct SubPath {
-    pts: Vec<(f64, f64)>,
-    closed: bool,
-}
-
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Gstate {
-    color: u32,
-    line_width: f64,
+    color: Color,
+    line_width: f32,
     line_cap: LineCap,
-    sx: f64,
-    sy: f64,
-    font_size: f64,
+    operator: Operator,
+    transform: Transform,
+    font_size: f32,
     bold: bool,
-    source: bool,
+    clip_mask: Option<Mask>,
+    source_surface: Option<ImageSurface>,
 }
 
 struct State {
     g: Gstate,
-    stack: Vec<(Gstate, i32)>,
-    path: Vec<SubPath>,
-    /// The current point in device pixels.
+    stack: Vec<Gstate>,
+    pb: PathBuilder,
     cur: Option<(f64, f64)>,
-    source: Option<ImageSurface>,
 }
 
-/// A drawing context on an [`ImageSurface`], like cairo's.
 pub struct Context {
     surface: ImageSurface,
     st: RefCell<State>,
@@ -372,102 +262,78 @@ pub struct Context {
 
 impl Context {
     pub fn new(surface: &ImageSurface) -> Result<Self, Error> {
-        let dc = surface.0.dc;
-        // A fresh context starts unclipped, like cairo's.
-        unsafe { SelectClipRgn(dc, ptr::null_mut()) };
         Ok(Self {
             surface: surface.clone(),
             st: RefCell::new(State {
                 g: Gstate {
-                    color: 0,
+                    color: Color::from_rgba8(0, 0, 0, 255),
                     line_width: 2.0,
                     line_cap: LineCap::Butt,
-                    sx: 1.0,
-                    sy: 1.0,
+                    operator: Operator::Over,
+                    transform: Transform::identity(),
                     font_size: 10.0,
                     bold: false,
-                    source: false,
+                    clip_mask: None,
+                    source_surface: None,
                 },
                 stack: Vec::new(),
-                path: Vec::new(),
+                pb: PathBuilder::new(),
                 cur: None,
-                source: None,
             }),
         })
     }
 
-    fn dc(&self) -> Hdc {
-        self.surface.0.dc
-    }
-
-    fn device(&self, x: f64, y: f64) -> (f64, f64) {
-        let g = self.st.borrow().g;
-        (x * g.sx, y * g.sy)
-    }
-
-    // ---- state ----
-
     pub fn save(&self) -> Result<(), Error> {
-        let token = unsafe { SaveDC(self.dc()) };
         let mut st = self.st.borrow_mut();
-        let g = st.g;
-        st.stack.push((g, token));
+        let g = st.g.clone();
+        st.stack.push(g);
         Ok(())
     }
 
     pub fn restore(&self) -> Result<(), Error> {
         let mut st = self.st.borrow_mut();
-        if let Some((g, token)) = st.stack.pop() {
+        if let Some(g) = st.stack.pop() {
             st.g = g;
-            unsafe { RestoreDC(self.dc(), token) };
         }
         Ok(())
     }
 
     pub fn identity_matrix(&self) {
-        let mut st = self.st.borrow_mut();
-        st.g.sx = 1.0;
-        st.g.sy = 1.0;
+        self.st.borrow_mut().g.transform = Transform::identity();
     }
 
     pub fn scale(&self, sx: f64, sy: f64) {
         let mut st = self.st.borrow_mut();
-        st.g.sx *= sx;
-        st.g.sy *= sy;
+        st.g.transform = st.g.transform.pre_scale(sx as f32, sy as f32);
     }
 
-    pub fn set_operator(&self, _op: Operator) {}
+    pub fn set_operator(&self, op: Operator) {
+        self.st.borrow_mut().g.operator = op;
+    }
 
-    pub fn set_source_rgba(&self, r: f64, g: f64, b: f64, _a: f64) {
-        let to8 = |v: f64| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
+    pub fn set_source_rgba(&self, r: f64, g: f64, b: f64, a: f64) {
         let mut st = self.st.borrow_mut();
-        st.g.color = (to8(b) << 16) | (to8(g) << 8) | to8(r);
-        st.g.source = false;
-        st.source = None;
+        st.g.color = Color::from_rgba(r as f32, g as f32, b as f32, a as f32).unwrap_or(Color::BLACK);
+        st.g.source_surface = None;
     }
 
-    /// Make `surface` the source: the next `paint` copies it, placed
-    /// at (x, y) in device pixels.
     pub fn set_source_surface(&self, surface: &ImageSurface, _x: f64, _y: f64) -> Result<(), Error> {
         let mut st = self.st.borrow_mut();
-        st.source = Some(surface.clone());
-        st.g.source = true;
+        st.g.source_surface = Some(surface.clone());
         Ok(())
     }
 
     pub fn set_line_width(&self, w: f64) {
-        self.st.borrow_mut().g.line_width = w;
+        self.st.borrow_mut().g.line_width = w as f32;
     }
 
     pub fn set_line_cap(&self, cap: LineCap) {
         self.st.borrow_mut().g.line_cap = cap;
     }
 
-    // ---- paths ----
-
     pub fn new_path(&self) {
         let mut st = self.st.borrow_mut();
-        st.path.clear();
+        st.pb = PathBuilder::new();
         st.cur = None;
     }
 
@@ -476,54 +342,69 @@ impl Context {
     }
 
     pub fn move_to(&self, x: f64, y: f64) {
-        let p = self.device(x, y);
         let mut st = self.st.borrow_mut();
-        st.path.push(SubPath {
-            pts: vec![p],
-            closed: false,
-        });
-        st.cur = Some(p);
-    }
-
-    fn line_to_device(&self, p: (f64, f64)) {
-        let mut st = self.st.borrow_mut();
-        if st.cur.is_none() || st.path.last().is_none_or(|s| s.closed) {
-            st.path.push(SubPath::default());
-        }
-        if let Some(sub) = st.path.last_mut() {
-            sub.pts.push(p);
-        }
-        st.cur = Some(p);
+        st.pb.move_to(x as f32, y as f32);
+        st.cur = Some((x, y));
     }
 
     pub fn line_to(&self, x: f64, y: f64) {
-        self.line_to_device(self.device(x, y));
+        let mut st = self.st.borrow_mut();
+        if st.cur.is_none() {
+            st.pb.move_to(x as f32, y as f32);
+        } else {
+            st.pb.line_to(x as f32, y as f32);
+        }
+        st.cur = Some((x, y));
     }
 
-    /// An arc from `a1` to `a2` radians, increasing like cairo's. With
-    /// a current point, a line joins it to the arc's start.
     pub fn arc(&self, cx: f64, cy: f64, r: f64, a1: f64, a2: f64) {
         let mut a2 = a2;
         while a2 < a1 {
             a2 += 2.0 * PI;
         }
-        let (sx, sy) = {
-            let g = self.st.borrow().g;
-            (g.sx, g.sy)
-        };
-        let span = a2 - a1;
-        let steps = ((span * r * sx.max(sy)).ceil() as usize).clamp(2, 96);
-        for i in 0..=steps {
-            let a = a1 + span * i as f64 / steps as f64;
-            self.line_to_device(((cx + r * a.cos()) * sx, (cy + r * a.sin()) * sy));
+        let p0x = cx + r * a1.cos();
+        let p0y = cy + r * a1.sin();
+        let had_cur = self.st.borrow().cur.is_some();
+        if had_cur {
+            self.line_to(p0x, p0y);
+        } else {
+            self.move_to(p0x, p0y);
         }
+
+        let mut cur_angle = a1;
+        while cur_angle < a2 {
+            let sweep = (a2 - cur_angle).min(PI / 2.0);
+            let next_angle = cur_angle + sweep;
+            let k = 4.0 / 3.0 * (sweep / 4.0).tan();
+
+            let cos1 = cur_angle.cos();
+            let sin1 = cur_angle.sin();
+            let cos2 = next_angle.cos();
+            let sin2 = next_angle.sin();
+
+            let cp0x = cx + r * cos1;
+            let cp0y = cy + r * sin1;
+            let p1x = cp0x - k * r * sin1;
+            let p1y = cp0y + k * r * cos1;
+
+            let p3x = cx + r * cos2;
+            let p3y = cy + r * sin2;
+            let p2x = p3x + k * r * sin2;
+            let p2y = p3y - k * r * cos2;
+
+            self.st.borrow_mut().pb.cubic_to(
+                p1x as f32, p1y as f32,
+                p2x as f32, p2y as f32,
+                p3x as f32, p3y as f32,
+            );
+            cur_angle = next_angle;
+        }
+        self.st.borrow_mut().cur = Some((cx + r * a2.cos(), cy + r * a2.sin()));
     }
 
     pub fn close_path(&self) {
         let mut st = self.st.borrow_mut();
-        if let Some(sub) = st.path.last_mut() {
-            sub.closed = true;
-        }
+        st.pb.close();
     }
 
     pub fn rectangle(&self, x: f64, y: f64, w: f64, h: f64) {
@@ -534,252 +415,237 @@ impl Context {
         self.close_path();
     }
 
-    /// Hand the recorded path to GDI as its current path.
-    fn emit_path(&self) {
-        let dc = self.dc();
-        let st = self.st.borrow();
-        unsafe {
-            BeginPath(dc);
-            for sub in &st.path {
-                let Some(&(x0, y0)) = sub.pts.first() else {
-                    continue;
-                };
-                MoveToEx(dc, x0.round() as i32, y0.round() as i32, ptr::null_mut());
-                let rest: Vec<GdiPoint> = sub.pts[1..]
-                    .iter()
-                    .map(|&(x, y)| GdiPoint {
-                        x: x.round() as i32,
-                        y: y.round() as i32,
-                    })
-                    .collect();
-                if !rest.is_empty() {
-                    PolylineTo(dc, rest.as_ptr(), rest.len() as u32);
-                }
-                if sub.closed {
-                    CloseFigure(dc);
-                }
-            }
-            EndPath(dc);
-        }
-    }
-
     pub fn fill(&self) -> Result<(), Error> {
-        self.emit_path();
-        let dc = self.dc();
-        let color = self.st.borrow().g.color;
-        unsafe {
-            let brush = CreateSolidBrush(color);
-            let old_brush = SelectObject(dc, brush);
-            let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
-            FillPath(dc);
-            SelectObject(dc, old_pen);
-            SelectObject(dc, old_brush);
-            DeleteObject(brush);
-        }
-        self.new_path();
+        let mut st = self.st.borrow_mut();
+        let pb = std::mem::replace(&mut st.pb, PathBuilder::new());
+        st.cur = None;
+        let Some(path) = pb.finish() else {
+            return Ok(());
+        };
+        let mut paint = Paint::default();
+        paint.set_color(st.g.color);
+        paint.blend_mode = match st.g.operator {
+            Operator::Source => BlendMode::Source,
+            Operator::Over => BlendMode::SourceOver,
+        };
+        paint.anti_alias = true;
+        let mut pm = self.surface.0.pixmap.borrow_mut();
+        pm.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            st.g.transform,
+            st.g.clip_mask.as_ref(),
+        );
         Ok(())
     }
 
     pub fn stroke(&self) -> Result<(), Error> {
-        self.emit_path();
-        let dc = self.dc();
-        let g = self.st.borrow().g;
-        let width = (g.line_width * g.sx.max(g.sy)).round().max(1.0) as u32;
-        let cap = match g.line_cap {
-            LineCap::Round => PS_ENDCAP_ROUND,
-            LineCap::Butt => PS_ENDCAP_FLAT,
+        let mut st = self.st.borrow_mut();
+        let pb = std::mem::replace(&mut st.pb, PathBuilder::new());
+        st.cur = None;
+        let Some(path) = pb.finish() else {
+            return Ok(());
         };
-        let brush = LogBrush {
-            style: BS_SOLID,
-            color: g.color,
-            hatch: 0,
+        let mut paint = Paint::default();
+        paint.set_color(st.g.color);
+        paint.blend_mode = match st.g.operator {
+            Operator::Source => BlendMode::Source,
+            Operator::Over => BlendMode::SourceOver,
         };
-        unsafe {
-            let pen = ExtCreatePen(
-                PS_GEOMETRIC | PS_SOLID | cap | PS_JOIN_ROUND,
-                width,
-                &brush,
-                0,
-                ptr::null(),
-            );
-            let old_pen = SelectObject(dc, pen);
-            let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-            StrokePath(dc);
-            SelectObject(dc, old_brush);
-            SelectObject(dc, old_pen);
-            DeleteObject(pen);
-        }
-        self.new_path();
+        paint.anti_alias = true;
+        let stroke = Stroke {
+            width: st.g.line_width,
+            miter_limit: 4.0,
+            line_cap: match st.g.line_cap {
+                LineCap::Butt => SkiaLineCap::Butt,
+                LineCap::Round => SkiaLineCap::Round,
+            },
+            line_join: LineJoin::Round,
+            dash: None,
+        };
+        let mut pm = self.surface.0.pixmap.borrow_mut();
+        pm.stroke_path(
+            &path,
+            &paint,
+            &stroke,
+            st.g.transform,
+            st.g.clip_mask.as_ref(),
+        );
         Ok(())
     }
 
-    /// Narrow the clip to the current path, as cairo's `clip` does.
     pub fn clip(&self) {
-        self.emit_path();
-        unsafe { SelectClipPath(self.dc(), RGN_AND) };
-        self.new_path();
+        let mut st = self.st.borrow_mut();
+        let pb = std::mem::replace(&mut st.pb, PathBuilder::new());
+        st.cur = None;
+        let Some(path) = pb.finish() else {
+            return;
+        };
+        let (w, h) = (self.surface.0.w as u32, self.surface.0.h as u32);
+        let ts = st.g.transform;
+        let has_curves = path.segments().any(|seg| matches!(seg, tiny_skia::PathSegment::CubicTo(..) | tiny_skia::PathSegment::QuadTo(..)));
+        if let Some(ref mut mask) = st.g.clip_mask {
+            mask.intersect_path(&path, FillRule::Winding, has_curves, ts);
+        } else {
+            let mut mask = match Mask::new(w, h) {
+                Some(m) => m,
+                None => return,
+            };
+            mask.fill_path(&path, FillRule::Winding, has_curves, ts);
+            st.g.clip_mask = Some(mask);
+        }
     }
 
     pub fn reset_clip(&self) {
-        unsafe { SelectClipRgn(self.dc(), ptr::null_mut()) };
+        self.st.borrow_mut().g.clip_mask = None;
     }
 
-    /// Fill the clip with the source color, or copy the source surface.
     pub fn paint(&self) -> Result<(), Error> {
-        let dc = self.dc();
-        let (w, h) = (self.surface.0.w, self.surface.0.h);
-        let source = self.st.borrow().source.clone();
-        if let Some(src) = source {
-            src.flush();
-            unsafe { BitBlt(dc, 0, 0, w, h, src.0.dc, 0, 0, SRCCOPY) };
+        let mut st = self.st.borrow_mut();
+        let (w, h) = (self.surface.0.w as u32, self.surface.0.h as u32);
+        if let Some(src) = st.g.source_surface.take() {
+            let src_pm = src.0.pixmap.borrow();
+            let mut pm = self.surface.0.pixmap.borrow_mut();
+            if st.g.transform.is_identity() && st.g.clip_mask.is_none() && st.g.operator == Operator::Source && pm.width() == src_pm.width() && pm.height() == src_pm.height() {
+                pm.data_mut().copy_from_slice(src_pm.data());
+                return Ok(());
+            }
+            let paint = PixmapPaint {
+                opacity: 1.0,
+                blend_mode: match st.g.operator {
+                    Operator::Source => BlendMode::Source,
+                    Operator::Over => BlendMode::SourceOver,
+                },
+                quality: FilterQuality::Nearest,
+            };
+            pm.draw_pixmap(0, 0, src_pm.as_ref(), &paint, st.g.transform, st.g.clip_mask.as_ref());
             return Ok(());
         }
-        unsafe { AbortPath(dc) };
-        self.new_path();
-        let g = self.st.borrow().g;
-        self.rectangle(0.0, 0.0, f64::from(w) / g.sx, f64::from(h) / g.sy);
-        self.fill()
-    }
 
-    // ---- text ----
+        let Some(rect) = Rect::from_xywh(0.0, 0.0, w as f32, h as f32) else {
+            return Ok(());
+        };
+        let mut paint = Paint::default();
+        paint.set_color(st.g.color);
+        paint.blend_mode = match st.g.operator {
+            Operator::Source => BlendMode::Source,
+            Operator::Over => BlendMode::SourceOver,
+        };
+        paint.anti_alias = false;
+        let mut pm = self.surface.0.pixmap.borrow_mut();
+        pm.fill_rect(rect, &paint, Transform::identity(), st.g.clip_mask.as_ref());
+        Ok(())
+    }
 
     pub fn select_font_face(&self, _family: &str, _slant: FontSlant, weight: FontWeight) {
         self.st.borrow_mut().g.bold = weight == FontWeight::Bold;
     }
 
     pub fn set_font_size(&self, size: f64) {
-        self.st.borrow_mut().g.font_size = size;
-    }
-
-    /// Select the font for the current size and weight; returns the
-    /// device-to-user scale for measurements.
-    fn use_font(&self) -> f64 {
-        let g = self.st.borrow().g;
-        let px = g.font_size * g.sy;
-        let key = ((px * 4.0).round() as i32, g.bold);
-        let surface = &self.surface.0;
-        let mut fonts = surface.fonts.borrow_mut();
-        let font = *fonts.entry(key).or_insert_with(|| {
-            let face: Vec<u16> = "Adwaita Sans\0".encode_utf16().collect();
-            unsafe {
-                CreateFontW(
-                    // Negative: the em height, which is what cairo's
-                    // font size means.
-                    -(px.round().max(1.0) as i32),
-                    0,
-                    0,
-                    0,
-                    if g.bold { FW_BOLD } else { FW_NORMAL },
-                    0,
-                    0,
-                    0,
-                    DEFAULT_CHARSET,
-                    0,
-                    0,
-                    ANTIALIASED_QUALITY,
-                    0,
-                    face.as_ptr(),
-                )
-            }
-        });
-        unsafe { SelectObject(surface.dc, font) };
-        g.sy
+        self.st.borrow_mut().g.font_size = size as f32;
     }
 
     pub fn text_extents(&self, s: &str) -> Result<TextExtents, Error> {
-        let sy = self.use_font();
-        let sx = self.st.borrow().g.sx;
-        let text: Vec<u16> = s.encode_utf16().collect();
-        let mut size = GdiPoint { x: 0, y: 0 };
-        let mut tm = TextMetricW::default();
-        let ok = unsafe {
-            GetTextExtentPoint32W(self.dc(), text.as_ptr(), text.len() as i32, &mut size) != 0
-                && GetTextMetricsW(self.dc(), &mut tm) != 0
-        };
-        if !ok {
-            return Err(Error);
+        let st = self.st.borrow();
+        let font_size = st.g.font_size;
+        let mut total_w = 0.0f32;
+        for ch in s.chars() {
+            let metrics = FONT.metrics(ch, font_size);
+            total_w += metrics.advance_width;
         }
-        // GDI measures the cell (ascent + descent); reporting it with
-        // the ascent as the bearing centers the cell where cairo would
-        // center the ink.
+        let line = FONT.horizontal_line_metrics(font_size).unwrap_or(fontdue::LineMetrics {
+            ascent: font_size * 0.8,
+            descent: -font_size * 0.2,
+            line_gap: 0.0,
+            new_line_size: font_size * 1.2,
+        });
+        let (sx, sy) = (st.g.transform.sx as f64, st.g.transform.sy as f64);
         Ok(TextExtents {
-            width: f64::from(size.x) / sx,
-            height: f64::from(tm.ascent + tm.descent) / sy,
-            y_bearing: -f64::from(tm.ascent) / sy,
+            width: total_w as f64 / sx.max(0.001),
+            height: (line.ascent - line.descent) as f64 / sy.max(0.001),
+            y_bearing: -line.ascent as f64 / sy.max(0.001),
         })
     }
 
     pub fn show_text(&self, s: &str) -> Result<(), Error> {
-        self.use_font();
-        let (x, y) = self.st.borrow().cur.unwrap_or((0.0, 0.0));
-        let color = self.st.borrow().g.color;
-        let text: Vec<u16> = s.encode_utf16().collect();
-        unsafe {
-            SetTextColor(self.dc(), color);
-            TextOutW(self.dc(), x.round() as i32, y.round() as i32, text.as_ptr(), text.len() as i32);
+        let st = self.st.borrow();
+        let (cur_x, cur_y) = st.cur.unwrap_or((0.0, 0.0));
+        let mut pt = tiny_skia::Point::from_xy(cur_x as f32, cur_y as f32);
+        st.g.transform.map_point(&mut pt);
+        let mut base_x = pt.x;
+        let base_y = pt.y;
+        let px_size = st.g.font_size * st.g.transform.sy;
+        let mut pm = self.surface.0.pixmap.borrow_mut();
+        let pw = pm.width() as i32;
+        let ph = pm.height() as i32;
+        let color = st.g.color;
+        let base_r = color.red();
+        let base_g = color.green();
+        let base_b = color.blue();
+        let base_a = color.alpha();
+
+        for ch in s.chars() {
+            let (metrics, bitmap) = FONT.rasterize(ch, px_size);
+            let gx = (base_x + metrics.xmin as f32).round() as i32;
+            let gy = (base_y - (metrics.ymin + metrics.height as i32) as f32).round() as i32;
+
+            let gw = metrics.width as i32;
+            let gh = metrics.height as i32;
+
+            let passes = if st.g.bold { 2 } else { 1 };
+            for pass in 0..passes {
+                let offset_x = if pass == 1 { 1 } else { 0 };
+                for ly in 0..gh {
+                    let py = gy + ly;
+                    if py < 0 || py >= ph {
+                        continue;
+                    }
+                    for lx in 0..gw {
+                        let px = gx + lx + offset_x;
+                        if px < 0 || px >= pw {
+                            continue;
+                        }
+                        let cov = bitmap[(ly * gw + lx) as usize];
+                        if cov == 0 {
+                            continue;
+                        }
+                        let mut alpha_f = (cov as f32 / 255.0) * base_a;
+                        if let Some(ref mask) = st.g.clip_mask {
+                            let mask_cov = mask.data()[(py * pw + px) as usize];
+                            if mask_cov == 0 {
+                                continue;
+                            }
+                            alpha_f *= mask_cov as f32 / 255.0;
+                        }
+
+                        let p_idx = ((py * pw + px) * 4) as usize;
+                        let data = pm.data_mut();
+                        let dst_r = data[p_idx] as f32 / 255.0;
+                        let dst_g = data[p_idx + 1] as f32 / 255.0;
+                        let dst_b = data[p_idx + 2] as f32 / 255.0;
+                        let dst_a = data[p_idx + 3] as f32 / 255.0;
+
+                        let src_r = base_r * alpha_f;
+                        let src_g = base_g * alpha_f;
+                        let src_b = base_b * alpha_f;
+                        let src_a = alpha_f;
+
+                        let inv_a = 1.0 - src_a;
+                        let out_r = ((src_r + dst_r * inv_a).clamp(0.0, 1.0) * 255.0).round() as u8;
+                        let out_g = ((src_g + dst_g * inv_a).clamp(0.0, 1.0) * 255.0).round() as u8;
+                        let out_b = ((src_b + dst_b * inv_a).clamp(0.0, 1.0) * 255.0).round() as u8;
+                        let out_a = ((src_a + dst_a * inv_a).clamp(0.0, 1.0) * 255.0).round() as u8;
+
+                        data[p_idx] = out_r;
+                        data[p_idx + 1] = out_g;
+                        data[p_idx + 2] = out_b;
+                        data[p_idx + 3] = out_a;
+                    }
+                }
+            }
+            base_x += metrics.advance_width * st.g.transform.sx;
         }
         Ok(())
-    }
-}
-
-impl Drop for Context {
-    fn drop(&mut self) {
-        let dc = self.dc();
-        let st = self.st.get_mut();
-        while let Some((_, token)) = st.stack.pop() {
-            unsafe { RestoreDC(dc, token) };
-        }
-        unsafe { SelectClipRgn(dc, ptr::null_mut()) };
-    }
-}
-
-/// A minimal PNG encoder: 8-bit RGB rows, stored (uncompressed)
-/// deflate blocks. Enough for `--render` screenshots without a crate.
-mod png {
-    use std::io::{self, Write};
-
-    fn crc32(bytes: &[u8]) -> u32 {
-        let mut c = 0xffff_ffffu32;
-        for &b in bytes {
-            c ^= u32::from(b);
-            for _ in 0..8 {
-                c = if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
-            }
-        }
-        !c
-    }
-
-    fn chunk<W: Write>(out: &mut W, kind: &[u8; 4], data: &[u8]) -> io::Result<()> {
-        out.write_all(&(data.len() as u32).to_be_bytes())?;
-        let mut body = kind.to_vec();
-        body.extend_from_slice(data);
-        out.write_all(&body)?;
-        out.write_all(&crc32(&body).to_be_bytes())
-    }
-
-    pub fn write<W: Write>(out: &mut W, w: u32, h: u32, raw: &[u8]) -> io::Result<()> {
-        out.write_all(b"\x89PNG\r\n\x1a\n")?;
-        let mut ihdr = Vec::new();
-        ihdr.extend_from_slice(&w.to_be_bytes());
-        ihdr.extend_from_slice(&h.to_be_bytes());
-        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
-        chunk(out, b"IHDR", &ihdr)?;
-        let mut z = vec![0x78, 0x01];
-        let blocks: Vec<&[u8]> = raw.chunks(65_535).collect();
-        for (i, block) in blocks.iter().enumerate() {
-            z.push(u8::from(i + 1 == blocks.len()));
-            let n = block.len() as u16;
-            z.extend_from_slice(&n.to_le_bytes());
-            z.extend_from_slice(&(!n).to_le_bytes());
-            z.extend_from_slice(block);
-        }
-        let (mut a, mut b) = (1u32, 0u32);
-        for &x in raw {
-            a = (a + u32::from(x)) % 65_521;
-            b = (b + a) % 65_521;
-        }
-        z.extend_from_slice(&((b << 16) | a).to_be_bytes());
-        chunk(out, b"IDAT", &z)?;
-        chunk(out, b"IEND", &[])
     }
 }

@@ -22,7 +22,6 @@ macro_rules! warn {
 
 mod backend;
 mod cairo;
-mod gdip;
 mod history;
 mod render;
 mod ui;
