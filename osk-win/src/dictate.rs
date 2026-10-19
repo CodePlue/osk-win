@@ -217,12 +217,16 @@ impl Dictator {
             }
             out = full;
         }
-        let out = out.trim().to_string();
-        if is_no_speech(&out) {
+        let spoken = strip_sound_labels(&out);
+        if spoken.is_empty() {
             warn!("[dictate] nothing typed: {secs:.1} s of audio at level {rms:.4}, whisper heard no speech ({out:?})");
             return Ok(String::new());
         }
-        Ok(out)
+        if !mostly_latin(&spoken) {
+            warn!("[dictate] nothing typed: {secs:.1} s of audio at level {rms:.4}, whisper made up non-English text ({spoken:?})");
+            return Ok(String::new());
+        }
+        Ok(spoken)
     }
 
     /// One greedy decode of `pcm` with an encoder window of
@@ -386,14 +390,42 @@ fn tail_levels(samples: &[f32], rate: u32, n: usize) -> Vec<f32> {
         .collect()
 }
 
-/// True when whisper's output is a no-speech marker rather than real words.
-fn is_no_speech(text: &str) -> bool {
-    let t = text.trim();
-    t.is_empty()
-        || t == "[BLANK_AUDIO]"
-        || t == "[NO_SPEECH]"
-        || t == "[SPEECH]"
-        || t == "[UNKNOWN_VALUE]"
+/// `text` without whisper's sound labels: anything it puts in square
+/// or round brackets, between asterisks or between music notes
+/// ("[BLANK_AUDIO]", "(claps)", "[airplane engine]", "*sighs*",
+/// "♪ music ♪"), which describe a sound instead of transcribing
+/// words. Whitespace is collapsed.
+fn strip_sound_labels(text: &str) -> String {
+    let mut out = String::new();
+    let mut close: Option<char> = None;
+    for c in text.chars() {
+        match close {
+            Some(end) if c == end => close = None,
+            Some(_) => {}
+            None => match c {
+                '[' => close = Some(']'),
+                '(' => close = Some(')'),
+                '*' | '♪' => close = Some(c),
+                _ => out.push(c),
+            },
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether most letters in `text` are Latin. Whisper is told to
+/// transcribe English; given mostly noise it can still make up text in
+/// another script, and that is never what was said.
+fn mostly_latin(text: &str) -> bool {
+    let letters = text.chars().filter(|c| c.is_alphabetic());
+    let (latin, other) = letters.fold((0, 0), |(l, o), c| {
+        if c.is_ascii_alphabetic() || ('\u{c0}'..='\u{24f}').contains(&c) {
+            (l + 1, o)
+        } else {
+            (l, o + 1)
+        }
+    });
+    latin >= other * 4
 }
 
 /// Process-wide model cache. Loaded on first use, reused afterwards.
@@ -792,5 +824,23 @@ mod tests {
             assert!(speech_contrast(&at(&tone)) < SPEECH_CONTRAST, "steady tone at {level}");
             assert!(speech_contrast(&at(&word)) > SPEECH_CONTRAST, "word at {level}");
         }
+    }
+
+    #[test]
+    fn sound_labels_are_not_typed() {
+        assert_eq!(strip_sound_labels("(claps)"), "");
+        assert_eq!(strip_sound_labels("[airplane engine]"), "");
+        assert_eq!(strip_sound_labels("[BLANK_AUDIO]"), "");
+        assert_eq!(strip_sound_labels("♪ music ♪"), "");
+        assert_eq!(strip_sound_labels("Hello (laughs) there *sighs*"), "Hello there");
+        assert_eq!(strip_sound_labels(" And so, my fellow Americans. "), "And so, my fellow Americans.");
+    }
+
+    #[test]
+    fn text_in_another_script_is_not_english() {
+        assert!(mostly_latin("And so my fellow Americans"));
+        assert!(mostly_latin("café crème déjà vu"));
+        assert!(!mostly_latin("Продолжение следует"));
+        assert!(!mostly_latin("ご視聴ありがとうございました"));
     }
 }
