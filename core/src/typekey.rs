@@ -122,6 +122,7 @@ impl CharMap {
             '.' => Some((KEY_DOT, false)),
             '/' => Some((KEY_SLASH, false)),
             // Shifted symbols.
+            '_' => Some((KEY_MINUS, true)),
             '+' => Some((KEY_EQUAL, true)),
             '{' => Some((KEY_LEFTBRACE, true)),
             '}' => Some((KEY_RIGHTBRACE, true)),
@@ -143,7 +144,7 @@ impl CharMap {
 /// fail halfway through a password or email address. `pause` runs
 /// after every character; the app passes a short sleep so the
 /// target settles, tests pass a no-op.
-pub fn type_string<S: KeySink>(
+pub fn type_string<S: KeySink + ?Sized>(
     sink: &mut S,
     map: &CharMap,
     s: &str,
@@ -180,7 +181,7 @@ pub fn type_string<S: KeySink>(
 /// Like [`type_string`], but a `\n` injects a KEY_ENTER press/release and a
 /// `\t` a KEY_TAB press/release (multi-line / tabbed replacements). Same
 /// whole-string validation: never type a prefix and fail halfway.
-pub fn type_text<S: KeySink>(
+pub fn type_text<S: KeySink + ?Sized>(
     sink: &mut S,
     map: &CharMap,
     s: &str,
